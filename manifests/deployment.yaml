@@ -1,0 +1,171 @@
+# =============================================================================
+# deployment.yaml — Kubernetes Deployment for the SQS Consumer
+# =============================================================================
+# Runs the Python SQS consumer as a Deployment.
+# KEDA manages the replica count (0→5) via the ScaledObject in
+# manifests/keda-scaled-object.yaml — do NOT set replicas here.
+#
+# GCP reference repo equivalent:
+#   manifests/deployment.yaml used:
+#   - serviceAccountName: keda-demo (with Workload Identity annotation)
+#   - image: gcr.io/<project>/keda-demo-app
+#   - env: PUB_SUB_TOPIC, PUB_SUB_PROJECT, PUB_SUB_SUBSCRIPTION
+#
+# AWS equivalent (this file):
+#   - serviceAccountName: keda-demo (with IRSA annotation)
+#   - image: <account>.dkr.ecr.<region>.amazonaws.com/keda-demo-app:<sha>
+#   - env: SQS_QUEUE_URL, AWS_REGION (from ConfigMap)
+#
+# Apply: kubectl apply -f manifests/deployment.yaml
+# =============================================================================
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: keda-demo
+  namespace: keda-demo
+  labels:
+    app.kubernetes.io/name: keda-demo
+    app.kubernetes.io/component: consumer
+    app.kubernetes.io/version: "${IMAGE_TAG}"
+    app.kubernetes.io/managed-by: kubectl
+  annotations:
+    # Deployment annotation for observability — tracks which git commit is running
+    deployment.kubernetes.io/revision: "1"
+    app.kubernetes.io/git-sha: "${GIT_SHA}"
+spec:
+  # ── IMPORTANT: Do NOT set 'replicas' here ─────────────────────────────────
+  # KEDA controls replica count via its HPA (from minReplicaCount=0 to maxReplicaCount=5).
+  # If you set 'replicas' here, it conflicts with KEDA's HPA and causes unstable scaling.
+  # KEDA will scale to 0 when the queue is empty — omitting 'replicas' lets KEDA own this.
+
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: keda-demo
+      app.kubernetes.io/component: consumer
+
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: keda-demo
+        app.kubernetes.io/component: consumer
+        app.kubernetes.io/version: "${IMAGE_TAG}"
+      annotations:
+        # Force pod restart when ConfigMap changes (normally pods don't restart on CM change)
+        # This checksum annotation changes when the ConfigMap content changes → rolling update
+        configmap-hash: "${CONFIGMAP_HASH}"
+
+    spec:
+      # ── Service Account (IRSA) ───────────────────────────────────────────────
+      # This SA has the IRSA annotation linking it to the IAM role.
+      # The EKS pod identity webhook injects the OIDC token automatically.
+      # boto3 in app.py discovers these credentials automatically — no keys needed.
+      serviceAccountName: keda-demo
+      automountServiceAccountToken: true
+
+      # ── Termination Grace Period ─────────────────────────────────────────────
+      # When KEDA scales down (queue empty), K8s sends SIGTERM to the pod.
+      # This gives app.py 40 seconds to finish processing the current message.
+      # Must be > the SQS visibility timeout (30s) to avoid message duplication.
+      terminationGracePeriodSeconds: 40
+
+      # ── Security Context (Pod level) ─────────────────────────────────────────
+      # Required by Pod Security Standards 'restricted' profile (set in namespace.yaml)
+      securityContext:
+        runAsNonRoot: true           # Pod must not run as root
+        runAsUser: 1001              # Must match Dockerfile USER uid
+        runAsGroup: 1001             # Must match Dockerfile GROUP gid
+        fsGroup: 1001                # File system group for mounted volumes
+        seccompProfile:
+          type: RuntimeDefault       # Use the container runtime's default seccomp profile
+
+      containers:
+        - name: app
+          # Image is injected at deploy time via envsubst
+          # Format: <account>.dkr.ecr.<region>.amazonaws.com/keda-demo-app:<git-sha>
+          # Using git SHA (not 'latest') ensures exact version traceability
+          # GCP equivalent: gcr.io/<project>/keda-demo-app:latest
+          image: "${ECR_REPO_URI}:${IMAGE_TAG}"
+
+          # Always pull to ensure the exact SHA tag is used (no cached stale images)
+          imagePullPolicy: Always
+
+          # ── Environment Variables (from ConfigMap) ─────────────────────────
+          # Non-sensitive config injected from ConfigMap
+          # Sensitive values come from IRSA (no Secrets needed for AWS auth)
+          envFrom:
+            - configMapRef:
+                name: keda-demo-config
+
+          # ── Resource Limits ────────────────────────────────────────────────
+          # Sized for t3.micro (2 vCPU, 1GB RAM)
+          # requests: guaranteed resources (used by K8s scheduler)
+          # limits:   hard ceiling (pod OOMKilled if memory exceeded)
+          resources:
+            requests:
+              cpu: "50m"        # 0.05 CPU = 5% of 1 vCPU core
+              memory: "64Mi"    # 64 MB RAM (boto3 + python runtime)
+            limits:
+              cpu: "200m"       # 0.2 CPU burst limit
+              memory: "128Mi"   # 128 MB RAM hard limit
+
+          # ── Security Context (Container level) ────────────────────────────
+          # Complements the pod-level securityContext for restricted PSS
+          securityContext:
+            allowPrivilegeEscalation: false  # Cannot gain more privileges than parent process
+            readOnlyRootFilesystem: false    # app.py writes to /tmp/healthy (health file)
+            capabilities:
+              drop:
+                - ALL                         # Drop ALL Linux capabilities (principle of least privilege)
+
+          # ── Liveness Probe ────────────────────────────────────────────────
+          # K8s checks this to determine if the pod is alive.
+          # If it fails 3 times, K8s restarts the pod.
+          # Checks the /tmp/healthy file written by app.py on startup.
+          livenessProbe:
+            exec:
+              command:
+                - python
+                - -c
+                - "import os, sys; sys.exit(0 if os.path.exists('/tmp/healthy') else 1)"
+            initialDelaySeconds: 10   # Wait 10s after pod start before first check
+            periodSeconds: 30         # Check every 30 seconds
+            timeoutSeconds: 5         # Fail if check takes > 5s
+            failureThreshold: 3       # Restart pod after 3 consecutive failures
+
+          # ── Readiness Probe ───────────────────────────────────────────────
+          # K8s checks this to determine if the pod is ready to receive work.
+          # KEDA's HPA considers readiness when assigning new messages.
+          readinessProbe:
+            exec:
+              command:
+                - python
+                - -c
+                - "import os, sys; sys.exit(0 if os.path.exists('/tmp/healthy') else 1)"
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 2
+
+      # ── Node Affinity (optional) ──────────────────────────────────────────
+      # Prefer scheduling on on-demand instances, not Spot (avoids interruptions
+      # mid-message-processing). Enable if you add Spot node groups later.
+      # affinity:
+      #   nodeAffinity:
+      #     preferredDuringSchedulingIgnoredDuringExecution:
+      #       - weight: 100
+      #         preference:
+      #           matchExpressions:
+      #             - key: eks.amazonaws.com/capacityType
+      #               operator: In
+      #               values: ["ON_DEMAND"]
+
+      # ── Topology Spread (optional for production) ─────────────────────────
+      # When maxReplicaCount=5 and you have multiple AZs, spread pods evenly
+      # topologySpreadConstraints:
+      #   - maxSkew: 1
+      #     topologyKey: topology.kubernetes.io/zone
+      #     whenUnsatisfiable: DoNotSchedule
+      #     labelSelector:
+      #       matchLabels:
+      #         app.kubernetes.io/name: keda-demo

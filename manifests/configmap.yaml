@@ -1,0 +1,47 @@
+# =============================================================================
+# configmap.yaml — Application Configuration for the SQS Consumer
+# =============================================================================
+# Stores non-sensitive configuration as key-value pairs.
+# Injected into the Deployment as environment variables.
+#
+# 12-Factor App (Factor III): Config stored in the environment.
+# Sensitive values (like actual SQS queue URL containing account ID)
+# are injected at deploy time via envsubst, NOT hardcoded here.
+#
+# Apply: kubectl apply -f manifests/configmap.yaml
+# =============================================================================
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: keda-demo-config
+  namespace: keda-demo
+  labels:
+    app.kubernetes.io/name: keda-demo
+    app.kubernetes.io/component: config
+    app.kubernetes.io/managed-by: kubectl
+data:
+  # ─── AWS Configuration ──────────────────────────────────────────────────────
+  # Region must match the SQS queue region and EKS cluster region
+  AWS_REGION: "us-east-1"
+
+  # Full SQS queue URL — injected at deploy time with envsubst
+  # Format: https://sqs.<region>.amazonaws.com/<account-id>/<queue-name>
+  # GCP equivalent was: PUB_SUB_TOPIC and PUB_SUB_SUBSCRIPTION env vars
+  SQS_QUEUE_URL: "${SQS_QUEUE_URL}"
+
+  # ─── Application Behaviour ──────────────────────────────────────────────────
+  # Structured JSON logging level for CloudWatch Logs Insights queries
+  LOG_LEVEL: "INFO"
+
+  # Long polling: SQS holds the connection open for up to 20s waiting for messages
+  # Reduces empty ReceiveMessage calls from ~3,600/hr to ~180/hr
+  SQS_WAIT_TIME_SECONDS: "20"
+
+  # One message per pod iteration — keeps KEDA scaling formula precise:
+  #   desired_replicas = ceil(queue_depth / 1) with queueLength=5
+  # Using MaxNumberOfMessages=1 means each pod handles exactly 1 message at a time
+  SQS_MAX_MESSAGES: "1"
+
+  # Health check file path — matches Dockerfile HEALTHCHECK CMD
+  HEALTH_FILE: "/tmp/healthy"
