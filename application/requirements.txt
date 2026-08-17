@@ -1,0 +1,13 @@
+# =============================================================================
+# requirements.txt — KEDA Demo SQS Consumer
+# AWS equivalent of google-cloud-pubsub used in reference repo
+# =============================================================================
+
+# AWS SDK for Python — replaces google-cloud-pubsub from reference repo
+boto3==1.34.144
+
+# Environment variable loading from .env file
+python-dotenv==1.0.1
+
+# Structured JSON logging for CloudWatch Logs Insights queries
+python-json-logger==2.0.7
