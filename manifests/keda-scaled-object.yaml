@@ -1,0 +1,144 @@
+# =============================================================================
+# keda-scaled-object.yaml — KEDA ScaledObject: SQS Queue Autoscaler
+# =============================================================================
+# This is THE central manifest of the entire project.
+# It defines WHAT metric KEDA monitors and HOW it scales the Deployment.
+#
+# GCP Reference Repo (reference):
+#   triggers:
+#     - type: gcp-pub-sub
+#       metadata:
+#         subscriptionName: keda-demo-topic-subscription
+#         subscriptionSize: "5"   <- 1 replica per 5 undelivered messages
+#
+# AWS Equivalent (this project):
+#   triggers:
+#     - type: aws-sqs-queue
+#       metadata:
+#         queueURL: https://sqs.us-east-1.amazonaws.com/.../keda-demo-queue
+#         queueLength: "5"        <- 1 replica per 5 visible messages
+#
+# ── Scaling Formula ────────────────────────────────────────────────────────────
+# desired_replicas = ceil(ApproximateNumberOfMessages / queueLength)
+#
+# Queue depth  │  queueLength=5  │  Replicas
+# ─────────────┼─────────────────┼──────────
+# 0 messages   │  ceil(0/5) = 0  │  0  (scale to ZERO 🎯)
+# 3 messages   │  ceil(3/5) = 1  │  1
+# 6 messages   │  ceil(6/5) = 2  │  2
+# 11 messages  │  ceil(11/5) = 3 │  3
+# 20 messages  │  ceil(20/5) = 4 │  4
+# 25 messages  │  ceil(25/5) = 5 │  5  (capped at maxReplicaCount)
+# 100 messages │  ceil(100/5) = 5│  5  (still capped, NOT 20)
+#
+# ── KEDA Internal Flow ────────────────────────────────────────────────────────
+# 1. ScaledObject created → KEDA Operator detects it
+# 2. KEDA creates/manages an HPA targeting the Deployment
+# 3. Every pollingInterval (15s):
+#    a. KEDA Metrics Adapter calls SQS GetQueueAttributes
+#    b. Reads ApproximateNumberOfMessages
+#    c. Exposes it as an external metric: keda-sqs-keda-demo-queue
+#    d. HPA reads the metric → computes desired replicas
+#    e. HPA instructs Deployment to scale
+# 4. When queue empty for cooldownPeriod (30s) → scale to 0
+#
+# Apply: kubectl apply -f manifests/keda-scaled-object.yaml
+# =============================================================================
+
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: keda-demo-scaledobject
+  namespace: keda-demo
+  labels:
+    app.kubernetes.io/name: keda-demo
+    app.kubernetes.io/component: autoscaler
+    app.kubernetes.io/managed-by: kubectl
+spec:
+  # ── Target: What to Scale ───────────────────────────────────────────────────
+  # Points to the Deployment defined in manifests/deployment.yaml
+  # KEDA will create and manage an HPA that targets this Deployment
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: keda-demo
+
+  # ── Replica Bounds ───────────────────────────────────────────────────────────
+  # minReplicaCount: 0 is the KEY value — scale-to-zero when queue is empty
+  # This means $0 compute cost when no messages are waiting.
+  # Without KEDA, the minimum for a standard HPA is 1 replica (always running).
+  minReplicaCount: 0   # ← Scale to ZERO when queue empty 🎯
+  maxReplicaCount: 5   # ← Hard ceiling, matches ResourceQuota in namespace.yaml
+
+  # ── Timing Configuration ─────────────────────────────────────────────────────
+  # pollingInterval: How often KEDA reads the SQS metric (seconds)
+  # Lower = faster response to new messages, but more SQS API calls
+  # 15s means: if 50 messages arrive, pods appear within ~15 seconds
+  pollingInterval: 15
+
+  # cooldownPeriod: How long KEDA waits after queue drains before scaling to 0
+  # Prevents flapping: if messages arrive sporadically, pods stay up for 30s
+  # after the last message is processed before scaling to 0
+  cooldownPeriod: 30
+
+  # ── Advanced HPA Configuration ───────────────────────────────────────────────
+  advanced:
+    # Horizontal Pod Autoscaler behaviour configuration
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleDown:
+          # Wait 30s of consistently low metric before scaling down
+          # Prevents aggressive scale-down that would cause message processing lag
+          stabilizationWindowSeconds: 30
+          policies:
+            - type: Percent
+              value: 100   # Allow scaling down to 0 in one step
+              periodSeconds: 30
+        scaleUp:
+          # React quickly to new messages — scale up immediately
+          stabilizationWindowSeconds: 0
+          policies:
+            - type: Pods
+              value: 5     # Can add up to 5 pods in one scale event
+              periodSeconds: 15
+
+  # ── Triggers: What Metric Drives Scaling ─────────────────────────────────────
+  triggers:
+    - type: aws-sqs-queue
+      # Reference the TriggerAuthentication that uses IRSA pod identity
+      # GCP equivalent: authenticationRef to Secret-based TriggerAuthentication
+      authenticationRef:
+        name: keda-trigger-auth-aws
+
+      metadata:
+        # ── Queue Target ─────────────────────────────────────────────────────
+        # Full SQS queue URL — injected at deploy time via envsubst
+        # Format: https://sqs.<region>.amazonaws.com/<account>/<queue-name>
+        # GCP equivalent: subscriptionName: keda-demo-topic-subscription
+        queueURL: "${SQS_QUEUE_URL}"
+
+        # AWS region of the SQS queue (must match the queue's region)
+        awsRegion: "us-east-1"
+
+        # ── Scaling Target ───────────────────────────────────────────────────
+        # Target number of messages per replica before scaling up.
+        # With queueLength=5: each replica handles ~5 messages concurrently.
+        # GCP equivalent: subscriptionSize: "5" (Pub/Sub undelivered messages)
+        # Formula: desired_replicas = ceil(visible_messages / queueLength)
+        queueLength: "5"
+
+        # ── In-Flight Message Handling ────────────────────────────────────────
+        # scaleOnInFlight: "false" means KEDA only counts VISIBLE messages
+        # (messages not currently being processed by any pod).
+        #
+        # If "true": KEDA counts visible + in-flight (invisible) messages
+        # Problem with "true": if 5 pods each process 1 message (5 in-flight),
+        # KEDA might scale UP thinking there's 5 more messages to handle.
+        # "false" is correct: if messages are in-flight, work is being done.
+        scaleOnInFlight: "false"
+
+        # ── Identity Owner ─────────────────────────────────────────────────
+        # Tells KEDA to use the pod's own IRSA credentials for this trigger.
+        # "operator" = use KEDA operator's IRSA role (keda-operator-role)
+        # This role has: sqs:GetQueueAttributes ONLY (read-only metric access)
+        identityOwner: operator
