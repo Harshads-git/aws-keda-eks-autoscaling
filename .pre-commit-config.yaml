@@ -1,0 +1,50 @@
+repos:
+  # ─── Python Linting ────────────────────────────────────────────────────────
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.4.4
+    hooks:
+      - id: ruff
+        args: [--fix]
+        name: ruff (Python linter + formatter)
+
+  # ─── YAML Linting ──────────────────────────────────────────────────────────
+  - repo: https://github.com/adrienverge/yamllint
+    rev: v1.35.1
+    hooks:
+      - id: yamllint
+        name: yamllint (YAML syntax checker)
+        args: [-d, relaxed]
+        files: \.(yml|yaml)$
+
+  # ─── General Hygiene ───────────────────────────────────────────────────────
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.6.0
+    hooks:
+      - id: trailing-whitespace
+        name: trim trailing whitespace
+      - id: end-of-file-fixer
+        name: ensure files end with newline
+      - id: check-yaml
+        name: validate YAML syntax
+        args: [--allow-multiple-documents]
+      - id: check-json
+        name: validate JSON syntax
+      - id: check-merge-conflict
+        name: detect merge conflict markers
+      - id: check-added-large-files
+        args: [--maxkb=1024]
+        name: block large files (>1MB)
+      - id: detect-private-key
+        name: detect accidentally committed private keys
+      - id: mixed-line-ending
+        args: [--fix=lf]
+        name: enforce LF line endings
+
+  # ─── Terraform ─────────────────────────────────────────────────────────────
+  - repo: https://github.com/antonbabenko/pre-commit-terraform
+    rev: v1.90.0
+    hooks:
+      - id: terraform_fmt
+        name: terraform fmt (format HCL files)
+      - id: terraform_validate
+        name: terraform validate (syntax check)
