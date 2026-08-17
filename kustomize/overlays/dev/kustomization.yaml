@@ -1,0 +1,98 @@
+# =============================================================================
+# kustomize/overlays/dev/kustomization.yaml
+# Dev environment overlay — patches the base for development/testing use.
+# =============================================================================
+# Differences from base (production defaults):
+#   - Reduced resource requests/limits (fits on t3.micro Free Tier)
+#   - LOG_LEVEL: DEBUG (verbose logging for development)
+#   - maxReplicaCount: 3 (lower cap to reduce accidental cost during testing)
+#   - pollingInterval: 10s (faster feedback during development)
+#   - Labels: environment=dev added to all resources
+#
+# Apply:
+#   kubectl apply -k kustomize/overlays/dev/
+#
+# Preview changes before applying:
+#   kubectl diff -k kustomize/overlays/dev/
+#
+# Teardown:
+#   kubectl delete -k kustomize/overlays/dev/
+# =============================================================================
+
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# ── Base ─────────────────────────────────────────────────────────────────────
+# This overlay extends the base layer defined in kustomize/base/
+resources:
+  - ../../base
+
+# ── Dev-specific labels added to ALL resources ────────────────────────────────
+commonLabels:
+  environment: dev
+
+# ── Image Override ────────────────────────────────────────────────────────────
+# In dev, use the 'latest' tag for convenience (always the newest build).
+# In prod overlay: use sha-<specific-commit> for exact version pinning.
+#
+# To update: kustomize edit set image keda-demo-app=<ecr-uri>:<sha>
+images:
+  - name: keda-demo-app
+    newName: "REPLACE_WITH_ECR_REPO_URI"
+    newTag: "latest"
+
+# ── Patches ───────────────────────────────────────────────────────────────────
+# Strategic merge patches modify specific fields without duplicating the whole YAML.
+# Only the fields listed here are changed — everything else comes from base.
+patches:
+  # ── Patch 1: Deployment — reduced resources for t3.micro Free Tier ─────────
+  - target:
+      kind: Deployment
+      name: keda-demo
+    patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: keda-demo
+      spec:
+        template:
+          spec:
+            containers:
+              - name: app
+                resources:
+                  requests:
+                    cpu: "25m"     # Half of base (50m) — t3.micro has limited CPU
+                    memory: "48Mi" # Slightly less than base (64Mi)
+                  limits:
+                    cpu: "100m"    # Half of base (200m)
+                    memory: "96Mi" # Less than base (128Mi)
+
+  # ── Patch 2: ConfigMap — DEBUG logging for development ─────────────────────
+  - target:
+      kind: ConfigMap
+      name: keda-demo-config
+    patch: |-
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: keda-demo-config
+      data:
+        LOG_LEVEL: "DEBUG"
+        # Slightly faster polling in dev for quicker feedback (10s vs default 15s)
+        # Note: This affects SQS API call frequency — OK for short dev sessions
+        SQS_WAIT_TIME_SECONDS: "5"
+
+  # ── Patch 3: ScaledObject — lower replica cap for dev safety ───────────────
+  - target:
+      kind: ScaledObject
+      name: keda-demo-scaledobject
+    patch: |-
+      apiVersion: keda.sh/v1alpha1
+      kind: ScaledObject
+      metadata:
+        name: keda-demo-scaledobject
+      spec:
+        minReplicaCount: 0   # Keep scale-to-zero in dev
+        maxReplicaCount: 3   # Lower cap: max 3 pods in dev (vs 5 in base)
+        pollingInterval: 10  # Poll every 10s in dev (vs 15s in base)
+        cooldownPeriod: 15   # Cool down faster in dev (vs 30s in base)
