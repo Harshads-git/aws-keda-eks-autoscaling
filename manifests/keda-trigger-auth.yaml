@@ -1,0 +1,67 @@
+# =============================================================================
+# keda-trigger-auth.yaml — KEDA TriggerAuthentication using AWS IRSA
+# =============================================================================
+# Tells KEDA how to authenticate with AWS SQS to read queue metrics.
+# KEDA needs to call SQS GetQueueAttributes to read ApproximateNumberOfMessages.
+#
+# GCP Reference Repo (reference):
+#   kind: TriggerAuthentication
+#   spec:
+#     secretTargetRef:
+#       - parameter: GoogleApplicationCredentials
+#         name: keda-demo-gcp-credentials
+#         key: credentials.json
+#
+#   This used a Kubernetes Secret containing GCP service account JSON key —
+#   a static credential that never expires and is high-risk if leaked.
+#
+# AWS Equivalent (this project) — IRSA Pod Identity:
+#   spec:
+#     podIdentity:
+#       provider: aws
+#
+#   No secrets. No static credentials. KEDA uses the OIDC token from its
+#   own ServiceAccount (keda-operator) to call STS and get temp credentials.
+#   The KEDA operator's ServiceAccount has a SEPARATE IRSA role with
+#   ONLY: sqs:GetQueueAttributes and cloudwatch:GetMetricData
+#
+# Security comparison:
+#   GCP approach: JSON key stored in K8s Secret
+#     - If Secret is stolen → permanent access until key is manually revoked
+#     - Must be rotated manually
+#   AWS IRSA approach: No secret stored anywhere
+#     - Credentials expire every 1 hour automatically
+#     - Cannot be stolen (there's nothing to steal)
+#     - Scope-limited: KEDA role cannot receive/delete messages (only read metrics)
+#
+# Apply: kubectl apply -f manifests/keda-trigger-auth.yaml
+# Namespace: keda-demo (where the ScaledObject lives)
+# =============================================================================
+
+apiVersion: keda.sh/v1alpha1
+kind: TriggerAuthentication
+metadata:
+  name: keda-trigger-auth-aws
+  namespace: keda-demo
+  labels:
+    app.kubernetes.io/name: keda-demo
+    app.kubernetes.io/component: keda-auth
+    app.kubernetes.io/managed-by: kubectl
+spec:
+  # ── IRSA Pod Identity ──────────────────────────────────────────────────────
+  # provider: aws tells KEDA to use the pod's projected ServiceAccount token
+  # to authenticate with AWS STS via AssumeRoleWithWebIdentity.
+  #
+  # KEDA then uses the resulting temporary credentials to call:
+  #   aws sqs get-queue-attributes --attribute-names ApproximateNumberOfMessages
+  #
+  # The IAM role used is the one annotated on the KEDA operator's ServiceAccount
+  # in the 'keda' namespace (configured in Terraform on Day 10):
+  #   eks.amazonaws.com/role-arn: arn:aws:iam::<account>:role/keda-operator-role
+  #
+  # Permissions on keda-operator-role (minimal, read-only):
+  #   sqs:GetQueueAttributes     ← reads ApproximateNumberOfMessages
+  #   cloudwatch:GetMetricData   ← optional, for CloudWatch-based scaling
+  # ──────────────────────────────────────────────────────────────────────────
+  podIdentity:
+    provider: aws
