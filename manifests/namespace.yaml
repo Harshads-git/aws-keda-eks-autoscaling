@@ -1,0 +1,60 @@
+# =============================================================================
+# namespace.yaml — Kubernetes Namespace for the KEDA Demo Application
+# =============================================================================
+# Creates an isolated namespace with:
+#   - Pod Security Standards enforcement (restricted profile)
+#   - Resource quotas to prevent runaway scaling costs
+#   - Labels for observability and cost allocation
+#
+# Apply: kubectl apply -f manifests/namespace.yaml
+# =============================================================================
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: keda-demo
+  labels:
+    # Standard Kubernetes labels for tooling (Helm, kubectl, monitoring)
+    app.kubernetes.io/name: keda-demo
+    app.kubernetes.io/managed-by: kubectl
+
+    # Pod Security Standards (Kubernetes 1.23+)
+    # 'restricted' profile enforces:
+    #   - Pods must run as non-root (our Dockerfile uses uid 1001 ✓)
+    #   - No privilege escalation allowed
+    #   - Seccomp profile must be set
+    #   - Host namespaces (hostNetwork, hostPID, hostIPC) are forbidden
+    # This replaces the deprecated PodSecurityPolicy resource
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/warn-version: latest
+
+    # Cost allocation labels — useful for AWS Cost Explorer tagging
+    environment: demo
+    project: keda-autoscaling
+
+---
+# =============================================================================
+# ResourceQuota — Prevents runaway scaling from consuming excessive resources
+# =============================================================================
+# KEDA will scale 0→5 replicas. Without a quota, a misconfigured ScaledObject
+# could theoretically create hundreds of pods and drain your AWS account.
+# This quota ensures a hard ceiling on resource consumption.
+# =============================================================================
+
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: keda-demo-quota
+  namespace: keda-demo
+spec:
+  hard:
+    # Maximum 10 pods in this namespace (5 KEDA replicas + headroom)
+    pods: "10"
+    # CPU and memory limits across all pods
+    # t3.micro has 2 vCPU and 1GB RAM — this quota is well within that
+    requests.cpu: "500m"      # 0.5 CPU total requested across all pods
+    requests.memory: "512Mi"  # 512 MB total memory requested
+    limits.cpu: "1000m"       # 1 CPU max total across all pods
+    limits.memory: "1Gi"      # 1 GB max total memory
