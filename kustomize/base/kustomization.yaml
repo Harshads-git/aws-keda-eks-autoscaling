@@ -1,0 +1,73 @@
+# =============================================================================
+# kustomize/base/kustomization.yaml
+# Kustomize base configuration — declares all manifests in this layer.
+# =============================================================================
+# Kustomize allows managing Kubernetes configurations across environments
+# (dev, staging, prod) without duplicating YAML files.
+#
+# How Kustomize works:
+#   base/              <- canonical manifests (this directory)
+#   overlays/dev/      <- dev-specific patches on top of base
+#   overlays/prod/     <- prod-specific patches on top of base
+#
+#   kubectl apply -k kustomize/overlays/dev/
+#   └─ Kustomize merges base + overlay and applies the result
+#
+# Kustomize vs Helm:
+#   Helm: template engine (go templates, values.yaml) — powerful but complex
+#   Kustomize: pure YAML patching — simpler, built into kubectl since v1.14
+#   For this project: Kustomize is sufficient and avoids Helm learning curve
+#
+# Apply base directly (not recommended — use an overlay instead):
+#   kubectl apply -k kustomize/base/
+# =============================================================================
+
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# ── Namespace applied to ALL resources in this base ──────────────────────────
+namespace: keda-demo
+
+# ── Metadata applied to ALL resources ────────────────────────────────────────
+# These labels are merged into every resource's metadata.labels
+commonLabels:
+  app.kubernetes.io/name: keda-demo
+  app.kubernetes.io/part-of: keda-autoscaling-demo
+  managed-by: kustomize
+
+# ── Resources (the manifests that make up this base) ─────────────────────────
+# Order here does NOT control apply order (kubectl handles that).
+# Dependency order is enforced by Kustomize's built-in resource sorting.
+resources:
+  - ../../manifests/namespace.yaml
+  - ../../manifests/serviceaccount.yaml
+  - ../../manifests/configmap.yaml
+  - ../../manifests/deployment.yaml
+  - ../../manifests/keda-trigger-auth.yaml
+  - ../../manifests/keda-scaled-object.yaml
+
+# ── Images ───────────────────────────────────────────────────────────────────
+# Kustomize image transformer: overrides the image tag in all resources
+# that reference 'keda-demo-app' without editing the YAML directly.
+# Overlays can override this with their own image tag.
+#
+# Usage: kustomize edit set image keda-demo-app=<ecr-uri>:<tag>
+# Or set directly in overlay's kustomization.yaml
+images:
+  - name: keda-demo-app
+    # newName and newTag are overridden by overlays or CI pipeline
+    # The placeholder values here document the expected format
+    newName: "REPLACE_WITH_ECR_REPO_URI"
+    newTag: "latest"
+
+# ── ConfigMap Generator ───────────────────────────────────────────────────────
+# Kustomize can generate ConfigMaps from literals or files.
+# We use our existing configmap.yaml (in resources above) instead,
+# but this shows the alternative approach for reference:
+#
+# configMapGenerator:
+#   - name: keda-demo-config
+#     literals:
+#       - AWS_REGION=us-east-1
+#       - LOG_LEVEL=INFO
+#       - SQS_WAIT_TIME_SECONDS=20
