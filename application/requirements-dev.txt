@@ -1,0 +1,23 @@
+# =============================================================================
+# requirements-dev.txt — Development & Testing Dependencies
+# NOT included in the Docker image (only requirements.txt is installed)
+# Install with: pip install -r requirements-dev.txt
+# =============================================================================
+
+# Production dependencies (include in dev environment too)
+-r requirements.txt
+
+# ─── Testing ──────────────────────────────────────────────────────────────────
+
+# AWS service mocking for unit tests — no real AWS account needed
+# Replaces google-cloud-testutils / Pub/Sub emulator from GCP reference
+moto[sqs]==5.0.3
+
+# Test framework
+pytest==8.2.2
+pytest-cov==5.0.0
+
+# ─── Code Quality ─────────────────────────────────────────────────────────────
+
+# Fast Python linter + formatter (replaces flake8 + black + isort)
+ruff==0.4.4
