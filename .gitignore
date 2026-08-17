@@ -61,7 +61,7 @@ tfplan
 
 # ─── Docker ──────────────────────────────────────────────────────────────────
 *.tar
-.dockerignore
+# Note: .dockerignore is intentionally tracked in git (versioned with Dockerfile)
 
 # ─── AWS / Secrets ───────────────────────────────────────────────────────────
 .env
