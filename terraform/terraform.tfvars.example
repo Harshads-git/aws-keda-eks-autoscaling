@@ -1,0 +1,28 @@
+# =============================================================================
+# terraform/terraform.tfvars.example
+# Copy this file to terraform.tfvars and fill in your values.
+# terraform.tfvars is gitignored — never commit real values.
+# =============================================================================
+
+# ── Project Identity ──────────────────────────────────────────────────────────
+project_name = "keda-demo"
+environment  = "dev"
+aws_region   = "us-east-1"
+
+# ── VPC Networking ────────────────────────────────────────────────────────────
+vpc_cidr             = "10.0.0.0/16"
+public_subnet_cidrs  = ["10.0.1.0/24", "10.0.2.0/24"]
+private_subnet_cidrs = ["10.0.3.0/24", "10.0.4.0/24"]
+single_nat_gateway   = true  # set false in production for HA
+
+# ── EKS Cluster ───────────────────────────────────────────────────────────────
+cluster_name       = "keda-demo-cluster"
+cluster_version    = "1.29"
+node_instance_type = "t3.micro"   # Free Tier eligible
+node_desired_size  = 1
+node_min_size      = 1
+node_max_size      = 3
+
+# ── Application ───────────────────────────────────────────────────────────────
+sqs_queue_name = "keda-demo-queue"
+app_namespace  = "keda-demo"
