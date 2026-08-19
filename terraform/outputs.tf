@@ -50,6 +50,33 @@ output "nat_gateway_ip" {
   value       = module.vpc.nat_gateway_ip
 }
 
+# ── SQS ───────────────────────────────────────────────────────────────────────
+
+output "sqs_queue_url" {
+  description = "SQS queue URL. Set as SQS_QUEUE_URL in .env and K8s ConfigMap."
+  value       = module.sqs.queue_url
+}
+
+output "sqs_queue_arn" {
+  description = "SQS queue ARN. Used in IAM policy Resource blocks."
+  value       = module.sqs.queue_arn
+}
+
+output "sqs_dlq_url" {
+  description = "Dead Letter Queue URL. Inspect failed messages here."
+  value       = module.sqs.dlq_url
+}
+
+output "consumer_policy_arn" {
+  description = "IAM policy ARN for consumer pods. Attached to keda-demo-app-role (Day 13)."
+  value       = module.sqs.consumer_policy_arn
+}
+
+output "keda_operator_policy_arn" {
+  description = "IAM policy ARN for KEDA operator. Attached to keda-operator-role (Day 14)."
+  value       = module.sqs.keda_operator_policy_arn
+}
+
 # ── EKS (populated from Day 10) ───────────────────────────────────────────────
 
 # output "cluster_name" {

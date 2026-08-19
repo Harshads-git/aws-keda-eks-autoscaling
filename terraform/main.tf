@@ -112,6 +112,29 @@ module "vpc" {
   single_nat_gateway = true
 }
 
+# ── SQS Module ────────────────────────────────────────────────────────────────
+# Creates the SQS queue that KEDA monitors and consumer pods process.
+# Replaces the manual scripts/setup-sqs.sh for infrastructure lifecycle.
+# Also creates IAM policies for consumer pods and KEDA operator (used Day 13-14).
+module "sqs" {
+  source = "./modules/sqs"
+
+  project_name = var.project_name
+  environment  = var.environment
+  queue_name   = var.sqs_queue_name
+
+  # Visibility timeout must be >= app.py processing time
+  # app.py processes in ~0.1s; 30s gives ample safety margin
+  visibility_timeout = 30
+
+  # Long polling (20s) — reduces SQS API calls by ~20x vs short polling
+  receive_wait_time = 20
+
+  # maxReceiveCount=3: 3 delivery attempts before message goes to DLQ
+  # Protects against poison pill messages blocking the queue
+  max_receive_count = 3
+}
+
 # ── Locals: Convenience Values ───────────────────────────────────────────────
 locals {
   account_id = data.aws_caller_identity.current.account_id
@@ -119,4 +142,7 @@ locals {
 
   # Common name prefix for all resources
   name_prefix = "${var.project_name}-${var.environment}"
+
+  # SQS values used in K8s ConfigMap and KEDA ScaledObject
+  sqs_queue_url = module.sqs.queue_url
 }
