@@ -38,6 +38,11 @@ terraform {
       source  = "hashicorp/helm"
       version = "~> 2.12"
     }
+    # TLS provider: fetches OIDC certificate thumbprint for IRSA setup
+    tls = {
+      source  = "hashicorp/tls"
+      version = "~> 4.0"
+    }
   }
 
   # ── S3 Backend (uncomment on Day 9 after running scripts/setup-terraform-state.sh)
@@ -133,6 +138,32 @@ module "sqs" {
   # maxReceiveCount=3: 3 delivery attempts before message goes to DLQ
   # Protects against poison pill messages blocking the queue
   max_receive_count = 3
+}
+
+# ── EKS Module ────────────────────────────────────────────────────────────────
+# Creates the Kubernetes control plane, worker nodes, and OIDC provider.
+# This is the resource that makes 'kubectl apply' work against a real cluster.
+# Cost: $0.10/hr (control plane) + $0.0104/hr (t3.micro node) = ~$79.50/month
+# Destroy when not actively testing: terraform destroy
+module "eks" {
+  source = "./modules/eks"
+
+  project_name = var.project_name
+  environment  = var.environment
+
+  # Networking: pass VPC outputs into EKS module
+  vpc_id             = module.vpc.vpc_id
+  public_subnet_ids  = module.vpc.public_subnet_ids
+  private_subnet_ids = module.vpc.private_subnet_ids
+
+  # Cluster config
+  cluster_version = var.cluster_version
+
+  # Node group sizing
+  node_instance_type = var.node_instance_type
+  node_desired_size  = var.node_desired_size
+  node_min_size      = var.node_min_size
+  node_max_size      = var.node_max_size
 }
 
 # ── Locals: Convenience Values ───────────────────────────────────────────────

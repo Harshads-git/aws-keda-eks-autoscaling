@@ -77,24 +77,29 @@ output "keda_operator_policy_arn" {
   value       = module.sqs.keda_operator_policy_arn
 }
 
-# ── EKS (populated from Day 10) ───────────────────────────────────────────────
+# ── EKS ───────────────────────────────────────────────────────────────────────
 
-# output "cluster_name" {
-#   description = "EKS cluster name — used in aws eks update-kubeconfig command."
-#   value       = module.eks.cluster_name
-# }
+output "cluster_name" {
+  description = "EKS cluster name. Use in: aws eks update-kubeconfig --name <this>"
+  value       = module.eks.cluster_name
+}
 
-# output "cluster_endpoint" {
-#   description = "EKS API server endpoint — used by kubectl and Terraform kubernetes provider."
-#   value       = module.eks.cluster_endpoint
-# }
+output "cluster_endpoint" {
+  description = "EKS API server endpoint. Used by kubectl and Kubernetes provider."
+  value       = module.eks.cluster_endpoint
+}
 
-# output "cluster_oidc_issuer_url" {
-#   description = "EKS OIDC issuer URL — used to create IRSA IAM roles (Day 13)."
-#   value       = module.eks.cluster_oidc_issuer_url
-# }
+output "cluster_oidc_issuer_url" {
+  description = "EKS OIDC issuer URL. Required for IRSA IAM role trust policies (Day 13)."
+  value       = module.eks.cluster_oidc_issuer_url
+}
 
-# output "kubeconfig_command" {
-#   description = "Run this command to configure kubectl after terraform apply."
-#   value       = "aws eks update-kubeconfig --name ${module.eks.cluster_name} --region ${var.aws_region}"
-# }
+output "oidc_provider_arn" {
+  description = "OIDC identity provider ARN. Used in IRSA IAM role trust policy."
+  value       = module.eks.oidc_provider_arn
+}
+
+output "kubeconfig_command" {
+  description = "Run this after terraform apply to configure kubectl."
+  value       = module.eks.kubeconfig_command
+}
