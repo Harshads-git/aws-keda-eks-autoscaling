@@ -166,6 +166,33 @@ module "eks" {
   node_max_size      = var.node_max_size
 }
 
+# ── IRSA Module ───────────────────────────────────────────────────────────────
+# Creates IAM roles that Kubernetes ServiceAccounts can assume via OIDC.
+# Connects: manifests/serviceaccount.yaml ←→ AWS IAM permissions
+# Two roles:
+#   consumer app role → sqs:ReceiveMessage + DeleteMessage (keda-demo pods)
+#   keda operator role → sqs:GetQueueAttributes only (KEDA operator pod)
+module "irsa" {
+  source = "./modules/irsa"
+
+  project_name = var.project_name
+  environment  = var.environment
+
+  # OIDC provider (from EKS module) — enables IRSA trust
+  oidc_provider_arn       = module.eks.oidc_provider_arn
+  cluster_oidc_issuer_url = module.eks.cluster_oidc_issuer_url
+
+  # IAM policies (from SQS module) — what each role can do
+  consumer_policy_arn      = module.sqs.consumer_policy_arn
+  keda_operator_policy_arn = module.sqs.keda_operator_policy_arn
+
+  # K8s identifiers — MUST match manifests/serviceaccount.yaml exactly
+  app_namespace        = var.app_namespace
+  app_service_account  = "keda-demo"
+  keda_namespace       = "keda"
+  keda_service_account = "keda-operator"
+}
+
 # ── Locals: Convenience Values ───────────────────────────────────────────────
 locals {
   account_id = data.aws_caller_identity.current.account_id

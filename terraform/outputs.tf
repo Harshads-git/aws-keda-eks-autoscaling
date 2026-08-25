@@ -103,3 +103,24 @@ output "kubeconfig_command" {
   description = "Run this after terraform apply to configure kubectl."
   value       = module.eks.kubeconfig_command
 }
+
+# ── IRSA Role ARNs ────────────────────────────────────────────────────────────
+
+output "consumer_role_arn" {
+  description = <<-EOF
+    Consumer pod IRSA role ARN.
+    Copy this into manifests/serviceaccount.yaml:
+      annotations:
+        eks.amazonaws.com/role-arn: <this value>
+  EOF
+  value = module.irsa.consumer_role_arn
+}
+
+output "keda_operator_role_arn" {
+  description = <<-EOF
+    KEDA operator IRSA role ARN.
+    Use in KEDA Helm install (Day 16):
+      --set serviceAccount.annotations."eks\.amazonaws\.com/role-arn"=<this value>
+  EOF
+  value = module.irsa.keda_operator_role_arn
+}
