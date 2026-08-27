@@ -1,0 +1,190 @@
+# =============================================================================
+# .github/workflows/ci.yml — Continuous Integration
+# =============================================================================
+# Runs on every Pull Request targeting main.
+# Provides fast feedback (< 5 minutes) before code is merged.
+#
+# Jobs:
+#   lint        → pre-commit hooks (black, isort, conventional commit check)
+#   test        → pytest with moto SQS mock (no real AWS needed)
+#   docker-build → validate Dockerfile builds (no push — saves ECR storage)
+#
+# Why separate CI from CD (ci.yml vs cd.yml)?
+#   CI: runs on PRs — checks code quality, never touches production
+#   CD: runs on merge to main — has AWS credentials, touches real infrastructure
+#   Separation prevents a PR from accidentally triggering a deployment.
+# =============================================================================
+
+name: CI — Lint, Test, Build
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      # Only run CI when relevant files change
+      - "application/**"
+      - "manifests/**"
+      - "kustomize/**"
+      - "terraform/**"
+      - ".github/workflows/ci.yml"
+      - ".pre-commit-config.yaml"
+
+  # Allow manual CI runs from the Actions tab (useful for debugging)
+  workflow_dispatch:
+
+# Cancel in-progress CI runs when a new commit is pushed to the same PR.
+# Prevents wasted runner minutes on stale runs.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.11"
+
+jobs:
+  # ── Job 1: Lint ─────────────────────────────────────────────────────────────
+  lint:
+    name: Lint & Format Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install pre-commit
+        run: pip install pre-commit
+
+      - name: Cache pre-commit environments
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pre-commit
+          key: pre-commit-${{ hashFiles('.pre-commit-config.yaml') }}
+          restore-keys: pre-commit-
+
+      - name: Run pre-commit on all files
+        run: pre-commit run --all-files --show-diff-on-failure
+
+      - name: Validate conventional commit message format
+        # Check that the PR title follows Conventional Commits
+        # (PR title becomes the squash-merge commit message)
+        run: |
+          PR_TITLE="${{ github.event.pull_request.title }}"
+          echo "PR title: ${PR_TITLE}"
+          if ! echo "${PR_TITLE}" | grep -qE "^(feat|fix|docs|chore|test|refactor|perf|style|ci|build|revert)(\(.+\))?: .{1,80}"; then
+            echo "❌ PR title does not follow Conventional Commits format"
+            echo "   Expected: <type>(<scope>): <short description>"
+            echo "   Example:  feat(sqs): add dead letter queue configuration"
+            exit 1
+          fi
+          echo "✅ PR title follows Conventional Commits format"
+
+  # ── Job 2: Test ─────────────────────────────────────────────────────────────
+  test:
+    name: Unit Tests (moto SQS mock)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: application
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: application/requirements*.txt
+
+      - name: Install production + dev dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install -r requirements-dev.txt
+
+      - name: Run tests with coverage
+        # No real AWS credentials needed: moto intercepts boto3 calls
+        env:
+          AWS_DEFAULT_REGION: us-east-1
+          AWS_ACCESS_KEY_ID: testing           # moto fake credentials
+          AWS_SECRET_ACCESS_KEY: testing
+          SQS_QUEUE_URL: https://sqs.us-east-1.amazonaws.com/123456789/test-queue
+        run: |
+          python -m pytest test_app.py \
+            --verbose \
+            --tb=short \
+            --cov=app \
+            --cov-report=term-missing \
+            --cov-fail-under=80
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        if: always()  # Upload even if tests fail (for debugging)
+        with:
+          name: coverage-report
+          path: application/.coverage
+          retention-days: 7
+
+  # ── Job 3: Docker Build ──────────────────────────────────────────────────────
+  docker-build:
+    name: Docker Build (validate Dockerfile)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image (no push)
+        uses: docker/build-push-action@v5
+        with:
+          context: ./application
+          file: ./application/Dockerfile
+          push: false           # CI only validates the build — no ECR push
+          tags: keda-demo-app:ci-${{ github.sha }}
+          cache-from: type=gha  # GitHub Actions cache (speeds up repeat builds)
+          cache-to: type=gha,mode=max
+          build-args: |
+            BUILD_DATE=${{ github.event.pull_request.created_at }}
+            GIT_SHA=${{ github.sha }}
+
+      - name: Verify image was built
+        run: |
+          echo "✅ Docker build succeeded for commit ${{ github.sha }}"
+          echo "   Image: keda-demo-app:ci-${{ github.sha }}"
+          echo "   This image will NOT be pushed (CI only)"
+          echo "   CD workflow pushes to ECR on merge to main"
+
+  # ── Job 4: Terraform Validate ─────────────────────────────────────────────
+  terraform-validate:
+    name: Terraform Validate & Format
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "~> 1.6"
+
+      - name: Terraform Format Check
+        working-directory: terraform
+        run: terraform fmt -check -recursive
+        # Fails if any .tf file is not properly formatted
+        # Fix locally: terraform fmt -recursive
+
+      - name: Terraform Init (local backend for validation only)
+        working-directory: terraform
+        run: terraform init -backend=false
+        # -backend=false: skip S3 backend (no AWS creds in CI for validation)
+
+      - name: Terraform Validate
+        working-directory: terraform
+        run: terraform validate
+        # Validates syntax and internal references (no AWS API calls)
