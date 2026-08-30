@@ -1,0 +1,66 @@
+---
+# manifests/servicemonitor.yaml
+# =============================================================================
+# ServiceMonitor: Tells Prometheus to scrape KEDA metrics.
+# =============================================================================
+# Prometheus Operator (part of kube-prometheus-stack) watches for ServiceMonitor
+# CRDs in all namespaces. When it finds one, it configures Prometheus to scrape
+# the service described by the selector.
+#
+# KEDA exposes metrics on port 8080 (/metrics) for the keda-operator.
+# These metrics include:
+#   keda_scaler_active            → 1 if scaler is active (queue not empty)
+#   keda_scaler_metrics_value     → current metric value (queue depth)
+#   keda_scaler_error_total       → number of scaling errors
+#   keda_scaled_object_paused     → 1 if ScaledObject is paused
+#
+# Key metric for Grafana:
+#   keda_scaler_metrics_value{scaledObject="keda-demo", namespace="keda-demo"}
+#   This is the raw queue depth that KEDA uses to compute desired replicas.
+#
+# Grafana PromQL queries:
+#   Queue depth:
+#     keda_scaler_metrics_value{namespace="keda-demo"}
+#   Desired replicas (computed from queue depth):
+#     kube_deployment_spec_replicas{deployment="keda-demo",namespace="keda-demo"}
+#   Running replicas:
+#     kube_deployment_status_replicas_ready{deployment="keda-demo",namespace="keda-demo"}
+# =============================================================================
+
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: keda-operator
+  namespace: keda  # ServiceMonitor lives in 'keda' namespace (same as KEDA)
+  labels:
+    app: keda-operator
+    release: kube-prometheus-stack  # Must match Prometheus label selector
+spec:
+  # Which service to scrape
+  selector:
+    matchLabels:
+      app: keda-operator  # Matches the KEDA operator Service's labels
+  # Prometheus is allowed to discover ServiceMonitors from ALL namespaces
+  # (configured via serviceMonitorNamespaceSelector={} in monitoring main.tf)
+  namespaceSelector:
+    matchNames:
+      - keda  # Only look for services in 'keda' namespace
+  endpoints:
+    - port: metrics           # Named port on the keda-operator Service (8080)
+      path: /metrics          # Default Prometheus scrape path
+      interval: 30s           # Scrape every 30 seconds
+      scrapeTimeout: 10s      # Timeout per scrape
+
+---
+# ServiceMonitor for keda-demo consumer app metrics
+# Our Python consumer doesn't expose Prometheus metrics by default.
+# When you add prometheus_client to app.py (Day 20), create a ServiceMonitor here.
+# For now, we monitor the app via kube-state-metrics (deployment replicas, pod status).
+#
+# kube-state-metrics gives us (no code changes needed):
+#   kube_deployment_spec_replicas{deployment="keda-demo",namespace="keda-demo"}
+#   kube_deployment_status_replicas_ready{deployment="keda-demo"}
+#   kube_pod_status_phase{pod=~"keda-demo-.*",namespace="keda-demo"}
+#   kube_pod_container_resource_requests{container="keda-demo",resource="memory"}
+#
+# These are the core metrics for the Grafana dashboard panels added in main.tf.
