@@ -160,3 +160,27 @@ variable "app_namespace" {
   type        = string
   default     = "keda-demo"
 }
+
+# ── Monitoring ─────────────────────────────────────────────────────────────────
+
+variable "monitoring_enabled" {
+  description = <<-EOF
+    Set to true to install Prometheus + Grafana via kube-prometheus-stack.
+    Requires t3.small or larger nodes (monitoring adds ~500MB RAM).
+    false (default): saves RAM on t3.micro for development.
+    true: enables full observability stack.
+  EOF
+  type    = bool
+  default = false
+}
+
+variable "grafana_admin_password" {
+  description = <<-EOF
+    Grafana admin dashboard password.
+    Access: kubectl port-forward svc/kube-prometheus-stack-grafana 3000:80 -n monitoring
+    Then: http://localhost:3000 (user: admin)
+  EOF
+  type      = string
+  sensitive = true
+  default   = "keda-demo-admin"
+}

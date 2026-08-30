@@ -193,6 +193,20 @@ module "irsa" {
   keda_service_account = "keda-operator"
 }
 
+# ── Monitoring Module (optional — enable via var.monitoring_enabled) ──────────
+# Installs Prometheus + Grafana via kube-prometheus-stack Helm chart.
+# Disabled by default to save RAM on t3.micro nodes.
+# Enable for t3.small or larger: set monitoring_enabled=true in tfvars.
+module "monitoring" {
+  source = "./modules/monitoring"
+  count  = var.monitoring_enabled ? 1 : 0
+
+  prometheus_stack_version = "55.5.0"
+  grafana_admin_password   = var.grafana_admin_password
+
+  depends_on = [module.eks]
+}
+
 # ── Locals: Convenience Values ───────────────────────────────────────────────
 locals {
   account_id = data.aws_caller_identity.current.account_id
