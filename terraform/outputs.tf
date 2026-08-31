@@ -124,3 +124,8 @@ output "keda_operator_role_arn" {
   EOF
   value = module.irsa.keda_operator_role_arn
 }
+
+output "cluster_autoscaler_role_arn" {
+  description = "Cluster Autoscaler IRSA role ARN. Use in: bash scripts/install-cluster-autoscaler.sh"
+  value       = module.eks.cluster_autoscaler_role_arn
+}

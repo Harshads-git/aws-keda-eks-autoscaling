@@ -56,3 +56,8 @@ output "kubeconfig_command" {
   description = "Run this command to configure kubectl after terraform apply."
   value       = "aws eks update-kubeconfig --name ${aws_eks_cluster.main.name} --region ${var.environment == "dev" ? "us-east-1" : "us-east-1"}"
 }
+
+output "cluster_autoscaler_role_arn" {
+  description = "IRSA role ARN for Cluster Autoscaler. Used in install-cluster-autoscaler.sh."
+  value       = aws_iam_role.cluster_autoscaler.arn
+}
