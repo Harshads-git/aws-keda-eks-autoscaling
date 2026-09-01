@@ -147,9 +147,25 @@ spec:
             timeoutSeconds: 3
             failureThreshold: 2
 
-      # ── Node Affinity (optional) ──────────────────────────────────────────
-      # Prefer scheduling on on-demand instances, not Spot (avoids interruptions
-      # mid-message-processing). Enable if you add Spot node groups later.
+          # ── Startup Probe ─────────────────────────────────────────────────
+          # Disables liveness/readiness checks until this succeeds.
+          # Prevents K8s from restarting a slow-starting container prematurely.
+          # 30s max startup time: failureThreshold(6) * periodSeconds(5) = 30s
+          # After success, liveness and readiness take over.
+          startupProbe:
+            exec:
+              command:
+                - python
+                - -c
+                - "import os, sys; sys.exit(0 if os.path.exists('/tmp/healthy') else 1)"
+            initialDelaySeconds: 5   # First check after 5s
+            periodSeconds: 5         # Retry every 5s
+            failureThreshold: 6      # Give up after 6 failures (30s total)
+            timeoutSeconds: 3
+
+      # ── Node Affinity ─────────────────────────────────────────────────────
+      # Prefer on-demand instances over Spot (avoids mid-message interruptions).
+      # Enable when you add Spot node groups for cost optimization.
       # affinity:
       #   nodeAffinity:
       #     preferredDuringSchedulingIgnoredDuringExecution:
@@ -160,12 +176,17 @@ spec:
       #               operator: In
       #               values: ["ON_DEMAND"]
 
-      # ── Topology Spread (optional for production) ─────────────────────────
-      # When maxReplicaCount=5 and you have multiple AZs, spread pods evenly
-      # topologySpreadConstraints:
-      #   - maxSkew: 1
-      #     topologyKey: topology.kubernetes.io/zone
-      #     whenUnsatisfiable: DoNotSchedule
-      #     labelSelector:
-      #       matchLabels:
-      #         app.kubernetes.io/name: keda-demo
+      # ── Topology Spread Constraints ───────────────────────────────────────
+      # Spreads pods across Availability Zones when multiple AZs have nodes.
+      # maxSkew=1: no AZ can have more than 1 extra pod vs other AZs.
+      # whenUnsatisfiable=ScheduleAnyway: still schedule even if spread is imperfect
+      #   (prevents Pending pods when cluster has limited nodes).
+      # Only effective when multiple nodes exist across AZs (CA adds nodes).
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway   # Soft constraint (don't block scheduling)
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: keda-demo
+          # matchLabelKeys: [pod-template-hash]  # Available in k8s 1.25+
