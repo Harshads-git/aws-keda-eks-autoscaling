@@ -177,7 +177,14 @@ echo ""
 # (KEDA CRD — the autoscaler brain, references Deployment + TriggerAuthentication)
 apply_manifest \
   "${MANIFESTS_DIR}/keda-scaled-object.yaml" \
-  "[6/6] ScaledObject: keda-demo-scaledobject (SQS trigger, 0→5 replicas)"
+  "[6/7] ScaledObject: keda-demo-scaledobject (SQS trigger, 0→5 replicas)"
+echo ""
+
+# Step 7: PodDisruptionBudget
+# (applied last — protects running pods from CA drain during node scale-down)
+apply_manifest \
+  "${MANIFESTS_DIR}/pdb.yaml" \
+  "[7/7] PodDisruptionBudget: keda-demo-pdb (maxUnavailable=1 during node drain)"
 echo ""
 
 # ─── Post-Deploy Verification ────────────────────────────────────────────────

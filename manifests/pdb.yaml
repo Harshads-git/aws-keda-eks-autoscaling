@@ -1,0 +1,81 @@
+---
+# manifests/pdb.yaml — PodDisruptionBudget for the SQS Consumer
+# =============================================================================
+# A PodDisruptionBudget (PDB) limits how many pods can be VOLUNTARILY disrupted
+# at the same time. It protects the consumer from losing too many pods during:
+#   - Cluster Autoscaler node drain (scale-down)
+#   - kubectl drain (node maintenance)
+#   - Rolling deployment (Deployment update)
+#
+# The keyword is VOLUNTARY disruptions:
+#   PDB protects against: CA draining a node, kubectl drain, rolling update
+#   PDB does NOT protect against: node crash (hardware failure), OOMKill
+#
+# Why a PDB for a queue consumer?
+#   Without PDB:
+#     CA decides to remove a node (underutilized)
+#     CA drains the node: evicts ALL pods on it simultaneously
+#     If all 5 consumer pods were on that node → queue processing STOPS
+#     Messages become invisible (visibility timeout) → processed again later = duplicates
+#
+#   With PDB (minAvailable=1):
+#     CA drains the node: tries to evict pods
+#     PDB allows eviction ONLY if at least 1 pod remains Running
+#     CA must wait until evicted pods reschedule elsewhere before removing the node
+#     Queue processing CONTINUES with at least 1 pod throughout
+#
+# PDB spec choices (this project uses maxUnavailable):
+#   minAvailable: N   → at least N pods must be running at all times
+#   maxUnavailable: N → at most N pods can be down at any time
+#   minAvailable: "50%" → at least half the desired replicas must be available
+#
+# KEDA + PDB interaction:
+#   When KEDA scales to 0 (queue empty): PDB is NOT enforced
+#   Kubernetes only enforces PDB when desired replicas >= minAvailable
+#   So: empty queue → KEDA scales to 0 → CA can drain without PDB interference
+#   Active queue → KEDA has N pods → PDB enforces at least 1 stays up
+# =============================================================================
+
+apiVersion: policy/v1  # policy/v1 available since Kubernetes 1.21
+kind: PodDisruptionBudget
+metadata:
+  name: keda-demo-pdb
+  namespace: keda-demo
+  labels:
+    app.kubernetes.io/name: keda-demo
+    app.kubernetes.io/component: consumer
+    app.kubernetes.io/managed-by: kubectl
+spec:
+  # At most 1 pod can be unavailable (disrupted) at any moment.
+  # With 5 replicas: CA can evict 1 pod at a time, must wait for replacement.
+  # With 1 replica: CA cannot evict at all (0 unavailable allowed: 1 - 1 = 0)
+  #   → forces CA to wait until KEDA scales down before removing the node.
+  maxUnavailable: 1
+
+  # Targets pods matching this label selector (must match deployment labels)
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: keda-demo
+      app.kubernetes.io/component: consumer
+
+---
+# =============================================================================
+# Optional: PDB for KEDA operator itself
+# Prevents disruption of the KEDA operator during node maintenance.
+# KEDA operator downtime = SQS metric polling stops = scaling pauses.
+# =============================================================================
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: keda-operator-pdb
+  namespace: keda
+  labels:
+    app.kubernetes.io/name: keda-operator
+    app.kubernetes.io/managed-by: kubectl
+spec:
+  # KEDA operator: at most 1 replica unavailable during disruption
+  # (KEDA runs with 1 replica by default; this means: don't evict it at all)
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: keda-operator
