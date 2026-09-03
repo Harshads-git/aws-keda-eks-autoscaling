@@ -227,7 +227,128 @@ automatically with `ScheduleAnyway`.
 
 ---
 
-## 5. Production Readiness Checklist
+## 5. Network Policy — Zero-Trust Pod Firewall
+
+Defined in [`manifests/network-policy.yaml`](../manifests/network-policy.yaml).
+
+```
+Default posture: DENY ALL → then explicitly ALLOW what is needed
+```
+
+### Policies applied
+
+| Policy | Direction | What it allows |
+|---|---|---|
+| `default-deny-ingress` | Ingress | Nothing — deny ALL inbound |
+| `allow-dns-egress` | Egress | UDP/TCP 53 → DNS resolution |
+| `allow-aws-api-egress` | Egress | TCP 443 → SQS, STS, ECR APIs |
+| `allow-keda-monitoring-ingress` | Ingress | From `keda` namespace on :8080 |
+| `allow-prometheus-scrape-ingress` | Ingress | From `monitoring` namespace on :8080 |
+
+### Without network policies
+
+```
+Any pod in the cluster can:
+  → connect to the consumer pods (port scanning, service discovery abuse)
+  → potentially pivot to the SQS credentials if consumer is compromised
+```
+
+### With network policies
+
+```
+Consumer pods:
+  ← BLOCKED: all inbound connections (nothing initiates to the consumer)
+  → ALLOWED: DNS lookups (port 53)
+  → ALLOWED: HTTPS to AWS APIs (port 443)
+  → BLOCKED: all other outbound (e.g., connecting to other pods)
+```
+
+### Enabling enforcement on EKS
+
+NetworkPolicy resources are stored in Kubernetes but **not enforced** unless
+a compatible CNI plugin is installed:
+
+```bash
+# Option 1: AWS Network Policy Controller (recommended, free EKS add-on)
+# Add to terraform/modules/eks/addons.tf:
+resource "aws_eks_addon" "network_policy" {
+  cluster_name  = aws_eks_cluster.main.name
+  addon_name    = "vpc-cni"  # Network policy support is part of VPC CNI 1.14+
+  # Also enable: ENABLE_NETWORK_POLICY = "true" in VPC CNI config
+}
+
+# Option 2: Verify via kubectl (after enabling):
+kubectl get networkpolicies -n keda-demo
+# Should show: default-deny-ingress, allow-dns-egress, allow-aws-api-egress, ...
+
+# Test enforcement:
+kubectl run test-pod --image=busybox --rm -it -- wget http://keda-demo-pod-ip:8080
+# Should fail with: Connection refused (policy blocks ingress)
+```
+
+---
+
+## 6. ResourceQuota — Namespace Resource Ceiling
+
+Defined in [`manifests/resource-quota.yaml`](../manifests/resource-quota.yaml).
+
+```yaml
+spec:
+  hard:
+    requests.cpu: "500m"
+    limits.cpu: "1000m"
+    requests.memory: "400Mi"
+    limits.memory: "800Mi"
+    pods: "10"
+    persistentvolumeclaims: "0"
+```
+
+### ResourceQuota vs Pod Limits — Two Layers of Protection
+
+```
+Pod limit (deployment.yaml):  1 pod cannot exceed 128Mi RAM
+ResourceQuota (this file):    ALL pods cannot exceed 800Mi RAM total
+
+Without quota: KEDA typo sets maxReplicaCount=100
+  100 pods × 128Mi = 12.8GB requested → nodes OOM → cluster down
+
+With quota: after 6th pod (6 × 128Mi = 768Mi), quota blocks pod 7+
+  KEDA creates Pending pods → quota error in keda_scaler_error_total
+  Alert fires → you fix the ScaledObject → cluster stays stable
+```
+
+### LimitRange — Auto-Inject Defaults
+
+```yaml
+spec:
+  limits:
+    - type: Container
+      default: { cpu: "200m", memory: "128Mi" }  # Auto-added if no limits block
+      defaultRequest: { cpu: "50m", memory: "64Mi" }
+      max: { cpu: "500m", memory: "256Mi" }  # Hard ceiling per container
+```
+
+Without LimitRange, ResourceQuota **rejects** pods that have no resource specs.
+LimitRange fills the gap by auto-injecting defaults.
+
+### Check quota usage
+
+```bash
+kubectl describe resourcequota keda-demo-quota -n keda-demo
+# Output:
+# Name:                    keda-demo-quota
+# Namespace:               keda-demo
+# Resource                 Used  Hard
+# ────────────────────     ────  ────
+# limits.cpu               0     1000m
+# limits.memory            0     800Mi
+# pods                     0     10
+# persistentvolumeclaims   0     0
+```
+
+---
+
+## 7. Updated Production Readiness Checklist
 
 ```
 ☑ Resource requests/limits on all containers
@@ -240,10 +361,12 @@ automatically with `ScheduleAnyway`.
 ☑ securityContext: runAsNonRoot, readOnlyRootFilesystem, drop ALL caps
 ☑ IRSA (no static AWS credentials)
 ☑ SQS visibility timeout < terminationGracePeriodSeconds (avoid duplicates)
+☑ NetworkPolicy: default-deny + allow DNS + allow AWS API egress
+☑ ResourceQuota: namespace CPU/memory/pod ceiling
+☑ LimitRange: auto-inject defaults for limitless pods
 
-Still to add (future days):
-☐ Horizontal Pod Autoscaler (KEDA manages this)
-☐ Network Policy (restrict pod-to-pod traffic)
-☐ Pod Security Standards (namespace enforced in namespace.yaml)
-☐ Prometheus alerts for KEDA errors and DLQ messages
+Still to add:
+☐ Enable AWS Network Policy Controller (Terraform add-on, EKS 1.25+)
+☐ Prometheus alerts: keda_scaler_error_total, DLQ message count
+☐ SQS DLQ CloudWatch alarm (already in Terraform — wire to SNS)
 ```
