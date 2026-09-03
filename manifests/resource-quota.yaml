@@ -1,0 +1,93 @@
+---
+# manifests/resource-quota.yaml — ResourceQuota for keda-demo namespace
+# =============================================================================
+# ResourceQuota sets hard limits on TOTAL resource consumption within a namespace.
+# It is a guard against runaway KEDA scaling consuming the entire node's capacity.
+#
+# ResourceQuota vs resource limits on individual pods:
+#   Pod limits (deployment.yaml):  per-pod ceiling   (1 pod can't exceed 128Mi RAM)
+#   ResourceQuota (this file):     per-namespace cap  (ALL pods can't exceed 800Mi RAM total)
+#
+# Example:
+#   Pod limit: 128Mi memory
+#   maxReplicaCount: 5 (from KEDA ScaledObject)
+#   ResourceQuota: 800Mi memory
+#   5 pods × 128Mi = 640Mi → within quota ✓
+#   10 pods × 128Mi = 1280Mi → quota blocks scheduling beyond 6 pods ✓
+#
+# This protects against:
+#   - KEDA ScaledObject misconfiguration (wrong maxReplicaCount)
+#   - Another workload added to the namespace consuming resources
+#   - Memory leaks growing beyond pod limits (OOMKilled but quota still accurate)
+# =============================================================================
+
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: keda-demo-quota
+  namespace: keda-demo
+  labels:
+    app.kubernetes.io/managed-by: kubectl
+spec:
+  hard:
+    # ── Compute ─────────────────────────────────────────────────────────────
+    # 5 pods × 200m CPU limit = 1000m (1 CPU) max burst
+    requests.cpu: "500m"      # Total guaranteed CPU for all pods
+    limits.cpu: "1000m"       # Total burst CPU ceiling for all pods
+
+    # 5 pods × 128Mi = 640Mi + headroom for probe overhead
+    requests.memory: "400Mi"  # Total guaranteed memory for all pods
+    limits.memory: "800Mi"    # Total memory ceiling for all pods (hard stop)
+
+    # ── Object Counts ────────────────────────────────────────────────────────
+    # Prevents accidental proliferation of K8s objects in this namespace
+    pods: "10"               # At most 10 pods total (KEDA max=5, room for rollout)
+    services: "5"            # At most 5 Services
+    configmaps: "10"         # At most 10 ConfigMaps
+    secrets: "10"            # At most 10 Secrets
+    persistentvolumeclaims: "0"  # No PVCs (consumer is stateless — no local storage)
+
+---
+# =============================================================================
+# LimitRange: Default Limits for Pods Without Explicit Resource Specs
+# =============================================================================
+# If a new pod/container is added to this namespace WITHOUT resource limits,
+# LimitRange automatically injects default limits.
+# This prevents "limitless" pods that can consume unbounded resources.
+#
+# Without LimitRange: ResourceQuota would REJECT pods with no resource specs
+# (quota requires all pods to have limits — pods without are blocked).
+# With LimitRange: quota-required limits are added automatically.
+# =============================================================================
+
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: keda-demo-limit-range
+  namespace: keda-demo
+  labels:
+    app.kubernetes.io/managed-by: kubectl
+spec:
+  limits:
+    - type: Container
+      # Default limits injected when a container has no resources spec
+      default:
+        cpu: "200m"
+        memory: "128Mi"
+      # Default requests injected when a container has no requests spec
+      defaultRequest:
+        cpu: "50m"
+        memory: "64Mi"
+      # Absolute maximum a single container can request/limit in this namespace
+      max:
+        cpu: "500m"
+        memory: "256Mi"
+      # Minimum a single container must request (prevents 0 resource specs)
+      min:
+        cpu: "10m"
+        memory: "16Mi"
+    - type: Pod
+      # Total max across ALL containers in a single pod
+      max:
+        cpu: "500m"
+        memory: "256Mi"
