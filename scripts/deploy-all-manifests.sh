@@ -184,7 +184,20 @@ echo ""
 # (applied last — protects running pods from CA drain during node scale-down)
 apply_manifest \
   "${MANIFESTS_DIR}/pdb.yaml" \
-  "[7/7] PodDisruptionBudget: keda-demo-pdb (maxUnavailable=1 during node drain)"
+  "[7/9] PodDisruptionBudget: keda-demo-pdb (maxUnavailable=1 during node drain)"
+echo ""
+
+# Step 8: NetworkPolicy (zero-trust pod firewall)
+# Deny all ingress, allow DNS + HTTPS egress to AWS APIs
+apply_manifest \
+  "${MANIFESTS_DIR}/network-policy.yaml" \
+  "[8/9] NetworkPolicy: default-deny-ingress + allow-dns + allow-aws-api-egress"
+echo ""
+
+# Step 9: ResourceQuota (namespace-level CPU/memory cap)
+apply_manifest \
+  "${MANIFESTS_DIR}/resource-quota.yaml" \
+  "[9/9] ResourceQuota: keda-demo-quota (limits total namespace resource usage)"
 echo ""
 
 # ─── Post-Deploy Verification ────────────────────────────────────────────────

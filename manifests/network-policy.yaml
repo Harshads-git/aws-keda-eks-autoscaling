@@ -1,0 +1,152 @@
+---
+# manifests/network-policy.yaml — Network Policy for the SQS Consumer
+# =============================================================================
+# NetworkPolicy is a Kubernetes firewall for pod-to-pod and pod-to-external traffic.
+# Requires a CNI plugin that enforces NetworkPolicies (AWS VPC CNI does NOT by default).
+# For enforcement on EKS: use Calico (aws-node-termination-handler) or AWS Network Policy Controller.
+#
+# AWS Network Policy Controller (recommended for EKS):
+#   - Integrated with VPC CNI since EKS 1.25+
+#   - Enable: add-on aws-network-policy-agent (managed via EKS console or Terraform add-ons)
+#   - No extra cost, uses eBPF-based packet filtering
+#
+# Zero-trust model: deny all, then allow exactly what is needed.
+#
+# What the consumer needs:
+#   EGRESS (outbound):
+#     → SQS API endpoint: sqs.us-east-1.amazonaws.com (HTTPS 443)
+#     → STS API endpoint: sts.amazonaws.com (HTTPS 443) — for IRSA token exchange
+#     → ECR API endpoint: *.ecr.amazonaws.com (HTTPS 443) — image pulls (if no VPC endpoint)
+#     → DNS: kube-dns (UDP/TCP 53) — to resolve SQS/STS endpoint hostnames
+#   INGRESS (inbound):
+#     None — the consumer is a worker pod, it receives no inbound connections
+#
+# GCP reference repo equivalent:
+#   GCP: VPC firewall rules + Workload Identity (no K8s NetworkPolicy in GKE by default)
+#   AWS: K8s NetworkPolicy + IRSA (similar trust model, different mechanism)
+# =============================================================================
+
+# ── Policy 1: Default Deny All Ingress to keda-demo namespace ─────────────────
+# Applies to ALL pods in the keda-demo namespace.
+# No ingress unless an explicit allow policy exists.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+  namespace: keda-demo
+  labels:
+    app.kubernetes.io/managed-by: kubectl
+spec:
+  podSelector: {}  # {} = selects ALL pods in this namespace
+  policyTypes:
+    - Ingress      # This policy controls inbound traffic
+
+---
+# ── Policy 2: Allow DNS Egress ────────────────────────────────────────────────
+# Consumer pods must resolve hostnames (sqs.us-east-1.amazonaws.com → IP).
+# kube-dns runs in kube-system namespace on port 53 (UDP and TCP).
+# Without this: boto3 cannot resolve AWS service endpoints → all API calls fail.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns-egress
+  namespace: keda-demo
+  labels:
+    app.kubernetes.io/managed-by: kubectl
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: keda-demo
+  policyTypes:
+    - Egress
+  egress:
+    - ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+      # No 'to:' selector = allow DNS to ANY destination (kube-dns is in kube-system)
+      # Scoping to kube-system would require cross-namespace label matching
+
+---
+# ── Policy 3: Allow HTTPS Egress to AWS APIs ──────────────────────────────────
+# SQS, STS (IRSA token exchange), and ECR all use HTTPS (port 443).
+# Without this: boto3 cannot call SQS → consumer cannot process messages.
+#
+# Note: We allow HTTPS to ANY external IP because AWS API IPs are not static.
+# In production, use VPC endpoints for SQS and STS + restrict egress to VPC CIDR.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-aws-api-egress
+  namespace: keda-demo
+  labels:
+    app.kubernetes.io/managed-by: kubectl
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: keda-demo
+  policyTypes:
+    - Egress
+  egress:
+    - ports:
+        - port: 443
+          protocol: TCP
+      # Allow HTTPS to any IP (AWS API endpoints have dynamic IPs)
+      # Enhancement: restrict to VPC CIDR block when using VPC endpoints
+
+---
+# ── Policy 4: Allow KEDA to Monitor Consumer Pods ─────────────────────────────
+# KEDA operator needs to communicate with the HPA and watch pod status.
+# KEDA operator runs in 'keda' namespace.
+# Without this: KEDA HPA operations may fail when strict ingress deny is in place.
+#
+# Note: KEDA typically communicates via the Kubernetes API server (not directly
+# to consumer pods). This policy is a safety net for any direct pod communication.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-keda-monitoring-ingress
+  namespace: keda-demo
+  labels:
+    app.kubernetes.io/managed-by: kubectl
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: keda-demo
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: keda
+      ports:
+        - port: 8080   # Metrics port (if consumer exposes /metrics in future)
+          protocol: TCP
+
+---
+# ── Policy 5: Allow Prometheus Scraping (when monitoring enabled) ──────────────
+# Prometheus in 'monitoring' namespace needs to scrape metrics from pods.
+# Currently the consumer has no /metrics endpoint, but this is pre-built for Day 20.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-prometheus-scrape-ingress
+  namespace: keda-demo
+  labels:
+    app.kubernetes.io/managed-by: kubectl
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: keda-demo
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        - port: 8080
+          protocol: TCP
