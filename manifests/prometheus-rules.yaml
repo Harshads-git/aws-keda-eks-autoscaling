@@ -1,0 +1,180 @@
+---
+# manifests/prometheus-rules.yaml — PrometheusRule: AlertManager Alert Rules
+# =============================================================================
+# PrometheusRule is a CRD installed by kube-prometheus-stack (Day 16).
+# Prometheus Operator watches PrometheusRule resources and loads the alert rules
+# into Prometheus automatically.
+#
+# How alerts work:
+#   1. Prometheus evaluates each rule expression every `interval` (default 1m)
+#   2. If `expr` returns non-empty results for `for` duration → alert is FIRING
+#   3. Prometheus sends FIRING alert to Alertmanager
+#   4. Alertmanager routes to notification channel (email, Slack, PagerDuty)
+#
+# Alert severity levels used here:
+#   critical: page on-call immediately (processing completely stopped)
+#   warning:  ticket + monitor (degraded but not stopped)
+#   info:     dashboard annotation (operational awareness)
+#
+# To apply:
+#   kubectl apply -f manifests/prometheus-rules.yaml
+#
+# To test alert firing:
+#   kubectl port-forward svc/kube-prometheus-stack-prometheus 9090:9090 -n monitoring
+#   http://localhost:9090/alerts  (shows PENDING and FIRING alerts)
+# =============================================================================
+
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: keda-demo-alerts
+  namespace: keda-demo
+  labels:
+    # This label tells Prometheus Operator to load this PrometheusRule
+    release: kube-prometheus-stack
+    app.kubernetes.io/managed-by: kubectl
+spec:
+  groups:
+    # ── Group 1: Message Processing Alerts ─────────────────────────────────────
+    - name: keda-demo.processing
+      interval: 60s  # Evaluate these rules every 60 seconds
+      rules:
+
+        # Alert: Consumer Not Processing Messages
+        # Fires when the consumer pods are running but not processing any messages
+        # for an extended period, despite the queue being non-empty.
+        # Root cause: app bug, IRSA expiry, or network policy blocking SQS access.
+        - alert: KedaDemoProcessingStalled
+          expr: |
+            (keda_scaler_metrics_value{scaledObject="keda-demo", namespace="keda-demo"} > 5)
+            and
+            (rate(keda_demo_messages_processed_total[10m]) == 0)
+            and
+            (kube_deployment_status_replicas_ready{deployment="keda-demo", namespace="keda-demo"} > 0)
+          for: 5m
+          labels:
+            severity: critical
+            team: platform
+          annotations:
+            summary: "SQS consumer is not processing messages"
+            description: |
+              Queue has {{ $value }} messages but consumer pods are running without processing.
+              Check: kubectl logs -n keda-demo -l app.kubernetes.io/name=keda-demo --tail=50
+              Possible causes: SQS API error, IRSA token expired, network policy blocking :443
+
+        # Alert: High Message Failure Rate
+        # Fires when more than 10% of processed messages are failing
+        # Root cause: bad message format, downstream dependency failure, code bug.
+        - alert: KedaDemoHighFailureRate
+          expr: |
+            rate(keda_demo_messages_failed_total[5m])
+            /
+            (rate(keda_demo_messages_processed_total[5m]) + rate(keda_demo_messages_failed_total[5m]))
+            > 0.10
+          for: 5m
+          labels:
+            severity: warning
+            team: platform
+          annotations:
+            summary: "SQS consumer failure rate above 10%"
+            description: |
+              {{ $value | humanizePercentage }} of messages are failing in namespace keda-demo.
+              Check DLQ: aws sqs get-queue-attributes --queue-url <dlq-url> --attribute-names ApproximateNumberOfMessages
+              Error breakdown: sum by(error_type)(rate(keda_demo_messages_failed_total[5m]))
+
+        # Alert: Slow Message Processing
+        # Fires when P99 processing time exceeds 5 seconds (unusual for this demo app).
+        # Root cause: slow downstream dependency, processing logic change, resource contention.
+        - alert: KedaDemoSlowProcessing
+          expr: |
+            histogram_quantile(0.99,
+              rate(keda_demo_message_processing_duration_seconds_bucket{namespace="keda-demo"}[10m])
+            ) > 5
+          for: 10m
+          labels:
+            severity: warning
+            team: platform
+          annotations:
+            summary: "Message processing P99 latency above 5 seconds"
+            description: |
+              P99 processing time is {{ $value | humanizeDuration }}.
+              SQS visibility timeout is 30s — slow processing risks message redelivery.
+              Check: kubectl top pods -n keda-demo (CPU/memory pressure?)
+
+    # ── Group 2: Queue Health Alerts ───────────────────────────────────────────
+    - name: keda-demo.queue
+      interval: 60s
+      rules:
+
+        # Alert: Dead Letter Queue Has Messages
+        # Messages in the DLQ mean the consumer failed to process them
+        # after maxReceiveCount attempts. This is a data loss risk.
+        - alert: KedaDemoDLQNotEmpty
+          expr: |
+            aws_sqs_approximate_number_of_messages_visible{queue_name=~".*-dlq"}
+            > 0
+          for: 5m
+          labels:
+            severity: critical
+            team: platform
+          annotations:
+            summary: "Messages in Dead Letter Queue — possible data loss"
+            description: |
+              {{ $value }} messages are stuck in the DLQ.
+              Investigate failed messages: aws sqs receive-message --queue-url <dlq-url>
+              After fixing root cause, redrive DLQ: aws sqs start-message-move-task
+
+        # Alert: Queue Growing Despite Consumers Running
+        # Queue depth is growing faster than the consumer can process.
+        # Root cause: message burst exceeds max replicas (5), need to increase KEDA maxReplicaCount.
+        - alert: KedaDemoQueueGrowing
+          expr: |
+            deriv(keda_scaler_metrics_value{scaledObject="keda-demo", namespace="keda-demo"}[10m]) > 1
+          for: 15m
+          labels:
+            severity: warning
+            team: platform
+          annotations:
+            summary: "SQS queue depth is growing faster than consumer capacity"
+            description: |
+              Queue depth is increasing at {{ $value | humanize }} msgs/second.
+              Max replicas (5) may be insufficient. Increase KEDA maxReplicaCount in ScaledObject.
+
+    # ── Group 3: KEDA Health Alerts ────────────────────────────────────────────
+    - name: keda-demo.keda
+      interval: 60s
+      rules:
+
+        # Alert: KEDA Scaler Errors
+        # Fires when KEDA fails to get metrics from SQS (IAM/network issue).
+        # When KEDA can't get metrics: it cannot scale pods → queue grows uncontrolled.
+        - alert: KEDAScalerErrors
+          expr: |
+            increase(keda_scaler_error_total{namespace="keda-demo"}[5m]) > 0
+          for: 5m
+          labels:
+            severity: critical
+            team: platform
+          annotations:
+            summary: "KEDA scaler is unable to get SQS queue metrics"
+            description: |
+              KEDA cannot query SQS metrics for the keda-demo ScaledObject.
+              Without metrics: KEDA cannot scale pods → queue will grow.
+              Check: kubectl logs -n keda -l app=keda-operator --tail=50
+              Possible cause: IRSA token expired, SQS endpoint unreachable, policy change
+
+        # Alert: ScaledObject is Paused
+        # A paused ScaledObject means KEDA is not scaling at all.
+        # Usually intentional (maintenance) but alerts if left paused.
+        - alert: KEDAScaledObjectPaused
+          expr: |
+            keda_scaled_object_paused{namespace="keda-demo"} == 1
+          for: 30m
+          labels:
+            severity: warning
+            team: platform
+          annotations:
+            summary: "KEDA ScaledObject is paused for more than 30 minutes"
+            description: |
+              The keda-demo ScaledObject has been paused for >30 minutes.
+              Unpause: kubectl annotate scaledobject keda-demo-scaledobject -n keda-demo autoscaling.keda.sh/paused-
