@@ -38,6 +38,12 @@ from typing import Any
 
 import boto3
 from botocore.exceptions import BotoCoreError, ClientError
+from prometheus_client import (
+    Counter,
+    Gauge,
+    Histogram,
+    start_http_server,
+)
 from pythonjsonlogger import jsonlogger
 
 # ─── Logging Setup ────────────────────────────────────────────────────────────
@@ -67,6 +73,56 @@ def setup_logging(level: str = "INFO") -> logging.Logger:
     handler.setFormatter(formatter)
     logger.addHandler(handler)
     return logger
+
+
+# ─── Prometheus Metrics ───────────────────────────────────────────────────────
+# Exposed on port 8080 at /metrics (standard Prometheus scrape endpoint).
+# Scraped by Prometheus via ServiceMonitor (manifests/servicemonitor.yaml).
+# NetworkPolicy allows inbound :8080 from 'monitoring' namespace.
+#
+# Metric naming convention: <namespace>_<subsystem>_<name>_<unit>
+# GCP reference repo equivalent: Cloud Monitoring custom metrics (auto-emitted)
+# AWS: must instrument manually with prometheus_client
+
+MESSAGES_PROCESSED = Counter(
+    "keda_demo_messages_processed_total",
+    "Total number of SQS messages successfully processed",
+    ["queue_name"],  # Label: which queue (useful if consumer handles multiple)
+)
+
+MESSAGES_FAILED = Counter(
+    "keda_demo_messages_failed_total",
+    "Total number of SQS messages that failed processing (not deleted, will retry)",
+    ["queue_name", "error_type"],  # Labels: queue + error class for grouping
+)
+
+PROCESSING_DURATION = Histogram(
+    "keda_demo_message_processing_duration_seconds",
+    "Time spent processing a single SQS message",
+    ["queue_name"],
+    # Default buckets cover 1ms to 10s range
+    buckets=[0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0],
+)
+
+CONSUMER_ACTIVE = Gauge(
+    "keda_demo_consumer_active",
+    "1 if this consumer pod is actively processing, 0 if idle (polling empty queue)",
+)
+
+SQS_POLL_ERRORS = Counter(
+    "keda_demo_sqs_poll_errors_total",
+    "Total SQS API errors (network issues, throttling, auth failures)",
+    ["error_code"],  # Label: AWS error code (e.g., AccessDenied, Throttling)
+)
+
+
+def start_metrics_server(port: int = 8080) -> None:
+    """
+    Start the Prometheus HTTP metrics server on the given port.
+    Called once at startup before the main polling loop.
+    Non-blocking: runs in a background thread.
+    """
+    start_http_server(port)
 
 
 # ─── Configuration ────────────────────────────────────────────────────────────
@@ -99,12 +155,13 @@ def load_config() -> dict[str, Any]:
         "visibility_timeout": int(os.environ.get("SQS_VISIBILITY_TIMEOUT", "30")),
         "health_file":        os.environ.get("HEALTH_FILE", "/tmp/healthy"),
         "shutdown_timeout":   int(os.environ.get("SHUTDOWN_TIMEOUT_SECONDS", "30")),
+        "metrics_port":       int(os.environ.get("METRICS_PORT", "8080")),
     }
 
 
 # ─── Message Processing ───────────────────────────────────────────────────────
 
-def process_message(message: dict[str, Any], logger: logging.Logger) -> bool:
+def process_message(message: dict[str, Any], logger: logging.Logger, queue_url: str = "") -> bool:
     """
     Process a single SQS message.
 
@@ -145,6 +202,8 @@ def process_message(message: dict[str, Any], logger: logging.Logger) -> bool:
         },
     )
 
+    queue_name = queue_url.split("/")[-1] if queue_url else "unknown"
+
     try:
         # ── Core processing logic ─────────────────────────────────────────────
         # In a real system this would be: database write, HTTP call, file transform, etc.
@@ -157,7 +216,13 @@ def process_message(message: dict[str, Any], logger: logging.Logger) -> bool:
         # Simulate brief processing time (remove in real implementations)
         time.sleep(0.1)
 
-        duration_ms = round((time.monotonic() - start_time) * 1000, 2)
+        duration_s = time.monotonic() - start_time
+        duration_ms = round(duration_s * 1000, 2)
+
+        # ── Record success metrics ────────────────────────────────────────────
+        MESSAGES_PROCESSED.labels(queue_name=queue_name).inc()
+        PROCESSING_DURATION.labels(queue_name=queue_name).observe(duration_s)
+
         logger.info(
             "Message processed successfully",
             extra={
@@ -168,7 +233,16 @@ def process_message(message: dict[str, Any], logger: logging.Logger) -> bool:
         return True
 
     except Exception as exc:  # noqa: BLE001
-        duration_ms = round((time.monotonic() - start_time) * 1000, 2)
+        duration_s = time.monotonic() - start_time
+        duration_ms = round(duration_s * 1000, 2)
+
+        # ── Record failure metrics ────────────────────────────────────────────
+        MESSAGES_FAILED.labels(
+            queue_name=queue_name,
+            error_type=type(exc).__name__,
+        ).inc()
+        PROCESSING_DURATION.labels(queue_name=queue_name).observe(duration_s)
+
         logger.error(
             "Message processing failed",
             extra={
@@ -307,6 +381,14 @@ class SQSConsumer:
         self._setup_signal_handlers()
         self._write_health_file()
 
+        # ── Start Prometheus metrics server ───────────────────────────────────
+        metrics_port = int(self.config.get("metrics_port", 8080))
+        start_metrics_server(metrics_port)
+        self.logger.info(
+            "Prometheus metrics server started",
+            extra={"port": metrics_port, "path": "/metrics"},
+        )
+
         self.logger.info(
             "SQS consumer started",
             extra={
@@ -322,6 +404,7 @@ class SQSConsumer:
         while self._running:
             try:
                 # ── Receive message (long polling) ────────────────────────────
+                CONSUMER_ACTIVE.set(0)  # Idle: waiting for messages
                 response = self.sqs.receive_message(
                     QueueUrl=self.config["queue_url"],
                     MaxNumberOfMessages=self.config["max_messages"],
@@ -353,10 +436,13 @@ class SQSConsumer:
                         break
 
                     self._processing = True
+                    CONSUMER_ACTIVE.set(1)  # Active: processing a message
                     message_id    = message.get("MessageId", "unknown")
                     receipt       = message.get("ReceiptHandle", "")
 
-                    success = process_message(message, self.logger)
+                    success = process_message(
+                        message, self.logger, queue_url=self.config["queue_url"]
+                    )
 
                     if success:
                         self._delete_message(receipt, message_id)
@@ -372,6 +458,7 @@ class SQSConsumer:
 
             except ClientError as e:
                 error_code = e.response["Error"]["Code"]
+                SQS_POLL_ERRORS.labels(error_code=error_code).inc()
                 self.logger.error(
                     "SQS API error during receive",
                     extra={"error_code": error_code, "error": str(e)},
@@ -380,6 +467,7 @@ class SQSConsumer:
                 time.sleep(5)
 
             except (BotoCoreError, Exception) as e:  # noqa: BLE001
+                SQS_POLL_ERRORS.labels(error_code=type(e).__name__).inc()
                 self.logger.error(
                     "Unexpected error in polling loop",
                     extra={"error": str(e), "error_type": type(e).__name__},
@@ -388,6 +476,7 @@ class SQSConsumer:
                 time.sleep(5)
 
         # ── Graceful shutdown ─────────────────────────────────────────────────
+        CONSUMER_ACTIVE.set(0)
         self._remove_health_file()
         self.logger.info("SQS consumer shut down cleanly")
 

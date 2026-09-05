@@ -11,3 +11,8 @@ python-dotenv==1.0.1
 
 # Structured JSON logging for CloudWatch Logs Insights queries
 python-json-logger==2.0.7
+
+# Prometheus metrics exposition (Day 20)
+# Exposes /metrics on :8080 — scraped by Prometheus via ServiceMonitor
+# Also used by: manifests/network-policy.yaml (allow :8080 from monitoring ns)
+prometheus-client==0.20.0
