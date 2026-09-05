@@ -1,0 +1,58 @@
+---
+# manifests/consumer-service.yaml — Kubernetes Service for metrics scraping
+# =============================================================================
+# The consumer Deployment has no Service by default (it's a worker, not a web server).
+# For Prometheus to scrape the consumer pods via ServiceMonitor, we need a headless
+# Service that exposes port 8080 (/metrics).
+#
+# This Service is ONLY for Prometheus scraping — not for user traffic.
+# ClusterIP=None (headless): Prometheus queries all pod IPs directly (not load-balanced).
+# =============================================================================
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: keda-demo-metrics
+  namespace: keda-demo
+  labels:
+    app.kubernetes.io/name: keda-demo
+    app.kubernetes.io/component: consumer
+    # This label is referenced by the ServiceMonitor selector below
+    app: keda-demo-consumer
+spec:
+  # ClusterIP: None = headless service
+  # Prometheus scrapes each pod IP individually (all N replicas)
+  # vs ClusterIP (load-balances to 1 pod, loses per-pod metrics)
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: keda-demo
+    app.kubernetes.io/component: consumer
+  ports:
+    - name: metrics  # Name must match ServiceMonitor endpoint.port
+      port: 8080
+      targetPort: 8080
+      protocol: TCP
+
+---
+# ServiceMonitor for consumer app metrics (new in Day 20)
+# Tells Prometheus to scrape /metrics from ALL consumer pods
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: keda-demo-consumer
+  namespace: keda-demo
+  labels:
+    app.kubernetes.io/name: keda-demo
+    release: kube-prometheus-stack  # Must match Prometheus label selector
+spec:
+  selector:
+    matchLabels:
+      app: keda-demo-consumer  # Matches the Service above
+  namespaceSelector:
+    matchNames:
+      - keda-demo
+  endpoints:
+    - port: metrics         # Named port on the Service (8080)
+      path: /metrics
+      interval: 30s         # Scrape every 30 seconds
+      scrapeTimeout: 10s
