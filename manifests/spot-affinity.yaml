@@ -1,0 +1,133 @@
+---
+# manifests/spot-affinity.yaml — Pod Scheduling Directives for Spot Nodes
+# =============================================================================
+# This file documents the nodeAffinity and tolerations that should be added
+# to manifests/deployment.yaml to schedule consumer pods on Spot nodes.
+#
+# Instead of applying as a standalone manifest, these settings are designed
+# to be MERGED into the Deployment spec. They are documented here separately
+# for clarity, and are applied via a Kustomize patch (kustomize/overlays/spot/).
+#
+# Pod scheduling for Spot nodes requires TWO settings:
+#   1. Toleration: allows the pod to schedule ON Spot nodes (which have NoSchedule taint)
+#   2. NodeAffinity: PREFERS Spot nodes but falls back to On-Demand if no Spot available
+#
+# Without toleration: pod cannot schedule on Spot nodes (taint blocks it)
+# Without nodeAffinity: pod might schedule on On-Demand even when Spot is available
+# =============================================================================
+
+# ── Kustomize Patch: Add Spot Scheduling to Consumer Deployment ───────────────
+# Apply with: kubectl apply -k kustomize/overlays/spot/
+# Or manually: kubectl patch deployment keda-demo -n keda-demo --patch-file spot-affinity.yaml
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: keda-demo
+  namespace: keda-demo
+spec:
+  template:
+    spec:
+      # ── Toleration: Allow scheduling on Spot nodes ──────────────────────────
+      # The Spot node group has taint: spot=true:NoSchedule (spot-node-group.tf)
+      # This toleration allows pods to be placed on those tainted nodes.
+      # Without it: pods are blocked from Spot nodes entirely.
+      tolerations:
+        - key: "spot"
+          operator: "Equal"
+          value: "true"
+          effect: "NoSchedule"
+        # Also tolerate the node.kubernetes.io/not-ready taint (Spot interruption)
+        # When AWS reclaims a Spot node, it first becomes NotReady briefly
+        - key: "node.kubernetes.io/not-ready"
+          operator: "Exists"
+          effect: "NoExecute"
+          tolerationSeconds: 30  # Tolerate for 30s then evict (graceful window)
+
+      # ── Node Affinity: Prefer Spot, Fall Back to On-Demand ──────────────────
+      affinity:
+        nodeAffinity:
+          # PREFER Spot nodes (soft preference — will use On-Demand if needed)
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 80  # Weight 80/100: strongly prefer Spot
+              preference:
+                matchExpressions:
+                  - key: "keda-demo/node-class"
+                    operator: In
+                    values: ["spot"]
+            - weight: 20  # Weight 20/100: weakly prefer On-Demand as fallback
+              preference:
+                matchExpressions:
+                  - key: "eks.amazonaws.com/capacityType"
+                    operator: In
+                    values: ["ON_DEMAND"]
+
+          # AVOID scheduling on On-Demand nodes if Spot is available
+          # requiredDuringScheduling would HARD-require Spot — risky if all Spot unavailable
+          # preferred is the right choice for cost-efficiency with resilience
+
+        # ── Pod Anti-Affinity: Spread Across Nodes ──────────────────────────
+        # Don't put all consumer pods on the same Spot node.
+        # If that node gets interrupted: all pods are lost simultaneously.
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: keda-demo
+                    app.kubernetes.io/component: consumer
+                topologyKey: kubernetes.io/hostname  # Spread across NODES (not just AZs)
+
+---
+# ── Kustomize Overlay: kustomize/overlays/spot/ ──────────────────────────────
+# To create a spot-optimized overlay (separate from base):
+#
+# kustomize/overlays/spot/kustomization.yaml:
+# ---
+# apiVersion: kustomize.config.k8s.io/v1beta1
+# kind: Kustomization
+# bases:
+#   - ../../base
+# patches:
+#   - path: spot-patch.yaml
+#     target:
+#       kind: Deployment
+#       name: keda-demo
+#
+# kustomize/overlays/spot/spot-patch.yaml:
+# (contents of the Deployment patch above)
+#
+# Apply: kubectl apply -k kustomize/overlays/spot/
+# =============================================================================
+
+# ── Spot Instance Type Priority ConfigMap ─────────────────────────────────────
+# Documents which instance types we use and their Spot interruption rates.
+# Used as reference by scripts/cost-estimate.sh
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: spot-instance-config
+  namespace: keda-demo
+  labels:
+    app.kubernetes.io/managed-by: kubectl
+    purpose: documentation
+data:
+  # Instance types in priority order (CA picks first available)
+  instance-types: |
+    t3.small    2 vCPU, 2GB RAM, ~$0.004/hr Spot, interruption rate: 5-10%
+    t3.medium   2 vCPU, 4GB RAM, ~$0.007/hr Spot, interruption rate: 5-10%
+    t3a.small   2 vCPU, 2GB RAM, ~$0.003/hr Spot, interruption rate: <5%
+    t3a.medium  2 vCPU, 4GB RAM, ~$0.006/hr Spot, interruption rate: <5%
+    m5.large    2 vCPU, 8GB RAM, ~$0.036/hr Spot, interruption rate: <5%
+
+  # Spot interruption rates from EC2 Spot Advisor (approx, changes daily)
+  # Low (<5%): most common for AMD/Graviton types
+  # Medium (5-10%): Intel types in popular sizes
+  # High (>10%): very popular sizes during peak demand (avoid these)
+
+  spot-strategy: |
+    Use capacity-optimized allocation (AWS default for EKS managed node groups).
+    capacity-optimized: AWS selects pool with MOST spare capacity -> lowest interruption
+    vs price-capacity-optimized: slightly higher price but even lower interruption rate
+    vs lowest-price: cheapest but highest interruption rate (avoid for workloads)
