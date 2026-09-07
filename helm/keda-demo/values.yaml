@@ -1,0 +1,150 @@
+# =============================================================================
+# helm/keda-demo/values.yaml — Default Chart Values
+# =============================================================================
+# All values here are overridable at install time:
+#   helm install keda-demo ./helm/keda-demo \
+#     --set image.tag=sha-abc1234 \
+#     --set aws.sqsQueueUrl=https://sqs.us-east-1.amazonaws.com/123/keda-demo-queue
+#
+# Environment-specific overrides:
+#   helm install keda-demo ./helm/keda-demo -f helm/keda-demo/values-prod.yaml
+# =============================================================================
+
+# ── Namespace ──────────────────────────────────────────────────────────────────
+namespace:
+  name: keda-demo
+  create: true           # Set false if namespace already exists
+  labels:
+    # Pod Security Standards: 'restricted' profile enforced
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted
+
+# ── Container Image ────────────────────────────────────────────────────────────
+image:
+  repository: ""         # REQUIRED: set to your ECR repo URI
+                         # e.g. 183264980.dkr.ecr.us-east-1.amazonaws.com/keda-demo-app
+  tag: latest            # Override with git SHA tag in CI: --set image.tag=sha-abc1234
+  pullPolicy: Always     # Always pull ensures exact SHA tag is used (no cached stale images)
+
+# ── AWS Configuration ──────────────────────────────────────────────────────────
+aws:
+  region: us-east-1
+  sqsQueueUrl: ""        # REQUIRED: full SQS queue URL from terraform output
+                         # e.g. https://sqs.us-east-1.amazonaws.com/183264980/keda-demo-queue
+  irsaRoleArn: ""        # REQUIRED: IAM role ARN from terraform output consumer_role_arn
+                         # e.g. arn:aws:iam::183264980:role/keda-demo-dev-consumer-role
+
+# ── Application Configuration ─────────────────────────────────────────────────
+app:
+  logLevel: INFO
+  sqsWaitTimeSeconds: 20       # Long polling: up to 20s per empty receive
+  sqsMaxMessages: 1            # 1 message per receive (predictable KEDA scaling)
+  sqsVisibilityTimeout: 30     # 30s to process before message reappears
+  metricsPort: 8080            # Prometheus /metrics endpoint port
+  healthFile: /tmp/healthy     # Kubernetes health probe file
+
+# ── KEDA Autoscaling ───────────────────────────────────────────────────────────
+keda:
+  enabled: true
+  minReplicaCount: 0           # Scale to zero when queue is empty
+  maxReplicaCount: 5           # Max consumer pods under heavy load
+  targetQueueLength: 5         # Scale up 1 pod per N messages (ceil(N/targetQueueLength))
+  pollingInterval: 15          # How often KEDA polls SQS (seconds)
+  cooldownPeriod: 300          # Wait 300s after scale-up before scaling down (seconds)
+  scaleToZeroOnInvalidMetrics: false  # Keep pods if SQS API fails (safer)
+
+# ── Resource Limits ────────────────────────────────────────────────────────────
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    cpu: 200m
+    memory: 128Mi
+
+# ── Replicas / Scaling ─────────────────────────────────────────────────────────
+# Do NOT set replicaCount — KEDA manages replicas via HPA.
+# Setting this would conflict with KEDA's ScaledObject.
+
+# ── Service Account (IRSA) ────────────────────────────────────────────────────
+serviceAccount:
+  create: true
+  name: keda-demo
+  annotations: {}      # IRSA annotation added automatically from aws.irsaRoleArn
+
+# ── Termination ────────────────────────────────────────────────────────────────
+terminationGracePeriodSeconds: 40  # Must exceed SQS visibility timeout (30s)
+
+# ── Security Context ──────────────────────────────────────────────────────────
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1001
+  runAsGroup: 1001
+  fsGroup: 1001
+  seccompProfile:
+    type: RuntimeDefault
+
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: false  # app.py writes /tmp/healthy
+  capabilities:
+    drop:
+      - ALL
+
+# ── Health Probes ──────────────────────────────────────────────────────────────
+probes:
+  startup:
+    initialDelaySeconds: 5
+    periodSeconds: 5
+    failureThreshold: 6    # 30s max startup window
+    timeoutSeconds: 3
+  liveness:
+    initialDelaySeconds: 10
+    periodSeconds: 30
+    failureThreshold: 3
+    timeoutSeconds: 5
+  readiness:
+    initialDelaySeconds: 5
+    periodSeconds: 10
+    failureThreshold: 2
+    timeoutSeconds: 3
+
+# ── Networking ────────────────────────────────────────────────────────────────
+networkPolicy:
+  enabled: true          # Deploy NetworkPolicy resources (requires CNI enforcement)
+
+metricsService:
+  enabled: true          # Deploy headless Service for Prometheus scraping
+  port: 8080
+
+# ── PodDisruptionBudget ───────────────────────────────────────────────────────
+podDisruptionBudget:
+  enabled: true
+  maxUnavailable: 1
+
+# ── Resource Quota ────────────────────────────────────────────────────────────
+resourceQuota:
+  enabled: true
+  hard:
+    requestsCpu: "500m"
+    limitsCpu: "1000m"
+    requestsMemory: "400Mi"
+    limitsMemory: "800Mi"
+    pods: "10"
+    persistentvolumeclaims: "0"
+
+# ── Topology Spread ────────────────────────────────────────────────────────────
+topologySpreadConstraints:
+  enabled: true
+  maxSkew: 1
+  topologyKey: topology.kubernetes.io/zone
+  whenUnsatisfiable: ScheduleAnyway
+
+# ── Spot Node Support ─────────────────────────────────────────────────────────
+spot:
+  enabled: false         # Set true to add Spot tolerations and nodeAffinity
+  toleration:
+    key: "spot"
+    value: "true"
+    effect: "NoSchedule"

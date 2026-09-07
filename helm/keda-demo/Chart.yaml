@@ -1,0 +1,41 @@
+apiVersion: v2
+name: keda-demo
+description: |
+  AWS SQS Consumer with KEDA Event-Driven Autoscaling on EKS.
+  AWS port of the GCP Pub/Sub KEDA demo:
+    github.com/ChimbuChinnadurai/gcp-keda-gke-event-driven-autoscaling-demo
+
+  Installs:
+    - Namespace with Pod Security Standards (restricted)
+    - ServiceAccount with IRSA annotation (AWS IAM role via OIDC)
+    - ConfigMap with SQS URL and AWS region
+    - Deployment (consumer app, KEDA manages replica count)
+    - Headless Service (for Prometheus metrics scraping)
+    - KEDA TriggerAuthentication (pod identity for SQS metric polling)
+    - KEDA ScaledObject (SQS queue depth → 0-5 replicas)
+    - PodDisruptionBudget (protects against CA node drain)
+    - NetworkPolicy (zero-trust: deny ingress, allow DNS + HTTPS)
+    - ResourceQuota + LimitRange (namespace resource governance)
+
+type: application
+version: 0.1.0        # Chart version (bump on every chart change)
+appVersion: "1.0.0"   # App version (matches application/app.py semantic version)
+
+keywords:
+  - keda
+  - autoscaling
+  - sqs
+  - eks
+  - aws
+
+home: https://github.com/Harshads-git/aws-keda-eks-autoscaling
+
+sources:
+  - https://github.com/Harshads-git/aws-keda-eks-autoscaling
+
+maintainers:
+  - name: Harshads-git
+    url: https://github.com/Harshads-git
+
+# Helm dependencies: none (KEDA installed separately via install-keda.sh)
+# This chart focuses on the application layer only.
