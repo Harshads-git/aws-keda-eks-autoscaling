@@ -1,0 +1,71 @@
+🎉 keda-demo chart installed successfully!
+
+Release: {{ .Release.Name }}
+Namespace: {{ include "keda-demo.namespace" . }}
+Chart version: {{ .Chart.Version }}
+App version: {{ .Chart.AppVersion }}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+NEXT STEPS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. Check the KEDA ScaledObject status:
+   kubectl get scaledobject -n {{ include "keda-demo.namespace" . }}
+
+2. Watch pods scale up (send messages to trigger):
+   kubectl get pods -n {{ include "keda-demo.namespace" . }} -w
+
+3. Send test messages to trigger autoscaling:
+   bash scripts/generate-messages.sh --count 25
+
+4. Check consumer logs:
+   kubectl logs -n {{ include "keda-demo.namespace" . }} \
+     -l app.kubernetes.io/name={{ include "keda-demo.name" . }} \
+     --tail=50 --follow
+
+5. View Prometheus metrics:
+   kubectl port-forward pod/$(kubectl get pod -n {{ include "keda-demo.namespace" . }} \
+     -l app.kubernetes.io/name={{ include "keda-demo.name" . }} \
+     -o jsonpath='{.items[0].metadata.name}') \
+     8080:8080 -n {{ include "keda-demo.namespace" . }}
+   # Then: curl http://localhost:8080/metrics | grep keda_demo
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+CONFIGURATION SUMMARY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+KEDA Scaling:
+  Min replicas:        {{ .Values.keda.minReplicaCount }}
+  Max replicas:        {{ .Values.keda.maxReplicaCount }}
+  Target queue length: {{ .Values.keda.targetQueueLength }} messages/pod
+  Cooldown period:     {{ .Values.keda.cooldownPeriod }}s
+
+Resources (per pod):
+  CPU:    {{ .Values.resources.requests.cpu }} request / {{ .Values.resources.limits.cpu }} limit
+  Memory: {{ .Values.resources.requests.memory }} request / {{ .Values.resources.limits.memory }} limit
+
+Features enabled:
+  NetworkPolicy:       {{ .Values.networkPolicy.enabled }}
+  PodDisruptionBudget: {{ .Values.podDisruptionBudget.enabled }}
+  ResourceQuota:       {{ .Values.resourceQuota.enabled }}
+  Metrics Service:     {{ .Values.metricsService.enabled }}
+  Spot Scheduling:     {{ .Values.spot.enabled }}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+UPGRADE / ROLLBACK
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Upgrade to new image:
+  helm upgrade {{ .Release.Name }} ./helm/keda-demo \
+    --set image.tag=<new-sha> --reuse-values
+
+Roll back to previous release:
+  helm rollback {{ .Release.Name }}
+
+View release history:
+  helm history {{ .Release.Name }}
+
+Uninstall:
+  helm uninstall {{ .Release.Name }}
+
+For full documentation: docs/helm-guide.md

@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "keda-demo.fullname" . }}-config
+  namespace: {{ include "keda-demo.namespace" . }}
+  labels:
+    {{- include "keda-demo.labels" . | nindent 4 }}
+data:
+  SQS_QUEUE_URL:            {{ .Values.aws.sqsQueueUrl | quote }}
+  AWS_REGION:               {{ .Values.aws.region | quote }}
+  LOG_LEVEL:                {{ .Values.app.logLevel | quote }}
+  SQS_WAIT_TIME_SECONDS:    {{ .Values.app.sqsWaitTimeSeconds | quote }}
+  SQS_MAX_MESSAGES:         {{ .Values.app.sqsMaxMessages | quote }}
+  SQS_VISIBILITY_TIMEOUT:   {{ .Values.app.sqsVisibilityTimeout | quote }}
+  METRICS_PORT:             {{ .Values.app.metricsPort | quote }}
+  HEALTH_FILE:              {{ .Values.app.healthFile | quote }}

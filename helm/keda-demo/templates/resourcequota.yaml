@@ -1,0 +1,43 @@
+{{- if .Values.resourceQuota.enabled }}
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: {{ include "keda-demo.fullname" . }}-quota
+  namespace: {{ include "keda-demo.namespace" . }}
+  labels:
+    {{- include "keda-demo.labels" . | nindent 4 }}
+spec:
+  hard:
+    requests.cpu:            {{ .Values.resourceQuota.hard.requestsCpu | quote }}
+    limits.cpu:              {{ .Values.resourceQuota.hard.limitsCpu | quote }}
+    requests.memory:         {{ .Values.resourceQuota.hard.requestsMemory | quote }}
+    limits.memory:           {{ .Values.resourceQuota.hard.limitsMemory | quote }}
+    pods:                    {{ .Values.resourceQuota.hard.pods | quote }}
+    persistentvolumeclaims:  {{ .Values.resourceQuota.hard.persistentvolumeclaims | quote }}
+
+---
+# LimitRange: auto-inject defaults for pods without resource specs
+# Required when ResourceQuota is enabled (quota rejects limitless pods)
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: {{ include "keda-demo.fullname" . }}-limit-range
+  namespace: {{ include "keda-demo.namespace" . }}
+  labels:
+    {{- include "keda-demo.labels" . | nindent 4 }}
+spec:
+  limits:
+    - type: Container
+      default:
+        cpu: {{ .Values.resources.limits.cpu | quote }}
+        memory: {{ .Values.resources.limits.memory | quote }}
+      defaultRequest:
+        cpu: {{ .Values.resources.requests.cpu | quote }}
+        memory: {{ .Values.resources.requests.memory | quote }}
+      max:
+        cpu: "500m"
+        memory: "256Mi"
+      min:
+        cpu: "10m"
+        memory: "16Mi"
+{{- end }}

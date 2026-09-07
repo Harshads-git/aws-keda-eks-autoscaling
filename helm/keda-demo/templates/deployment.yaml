@@ -1,0 +1,121 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "keda-demo.fullname" . }}
+  namespace: {{ include "keda-demo.namespace" . }}
+  labels:
+    {{- include "keda-demo.labels" . | nindent 4 }}
+  annotations:
+    # Checksum forces pod restart when ConfigMap changes (envFrom picks up new values)
+    checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+spec:
+  # Do NOT set replicas — KEDA ScaledObject manages this via HPA
+  # Setting replicas would conflict with KEDA and cause a scaling race
+  selector:
+    matchLabels:
+      {{- include "keda-demo.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "keda-demo.selectorLabels" . | nindent 8 }}
+        {{- include "keda-demo.labels" . | nindent 8 }}
+      annotations:
+        # Restart pods when ConfigMap changes (same checksum as Deployment)
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+    spec:
+      serviceAccountName: {{ include "keda-demo.serviceAccountName" . }}
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+
+      # ── Security Context ────────────────────────────────────────────────────
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+
+      # ── Spot Tolerations (optional) ─────────────────────────────────────────
+      {{- if .Values.spot.enabled }}
+      tolerations:
+        - key: {{ .Values.spot.toleration.key | quote }}
+          operator: "Equal"
+          value: {{ .Values.spot.toleration.value | quote }}
+          effect: {{ .Values.spot.toleration.effect | quote }}
+        - key: "node.kubernetes.io/not-ready"
+          operator: "Exists"
+          effect: "NoExecute"
+          tolerationSeconds: 30
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 80
+              preference:
+                matchExpressions:
+                  - key: "keda-demo/node-class"
+                    operator: In
+                    values: ["spot"]
+        {{- end }}
+
+      # ── Topology Spread ─────────────────────────────────────────────────────
+      {{- if .Values.topologySpreadConstraints.enabled }}
+      topologySpreadConstraints:
+        - maxSkew: {{ .Values.topologySpreadConstraints.maxSkew }}
+          topologyKey: {{ .Values.topologySpreadConstraints.topologyKey | quote }}
+          whenUnsatisfiable: {{ .Values.topologySpreadConstraints.whenUnsatisfiable }}
+          labelSelector:
+            matchLabels:
+              {{- include "keda-demo.selectorLabels" . | nindent 14 }}
+      {{- end }}
+
+      containers:
+        - name: consumer
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+
+          # Environment from ConfigMap
+          envFrom:
+            - configMapRef:
+                name: {{ include "keda-demo.fullname" . }}-config
+
+          ports:
+            - name: metrics
+              containerPort: {{ .Values.app.metricsPort }}
+              protocol: TCP
+
+          # ── Security Context ───────────────────────────────────────────────
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+
+          # ── Resource Limits ────────────────────────────────────────────────
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+
+          # ── Health Probes ──────────────────────────────────────────────────
+          startupProbe:
+            exec:
+              command:
+                - python
+                - -c
+                - "import os, sys; sys.exit(0 if os.path.exists('{{ .Values.app.healthFile }}') else 1)"
+            initialDelaySeconds: {{ .Values.probes.startup.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.startup.periodSeconds }}
+            failureThreshold: {{ .Values.probes.startup.failureThreshold }}
+            timeoutSeconds: {{ .Values.probes.startup.timeoutSeconds }}
+
+          livenessProbe:
+            exec:
+              command:
+                - python
+                - -c
+                - "import os, sys; sys.exit(0 if os.path.exists('{{ .Values.app.healthFile }}') else 1)"
+            initialDelaySeconds: {{ .Values.probes.liveness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.liveness.periodSeconds }}
+            failureThreshold: {{ .Values.probes.liveness.failureThreshold }}
+            timeoutSeconds: {{ .Values.probes.liveness.timeoutSeconds }}
+
+          readinessProbe:
+            exec:
+              command:
+                - python
+                - -c
+                - "import os, sys; sys.exit(0 if os.path.exists('{{ .Values.app.healthFile }}') else 1)"
+            initialDelaySeconds: {{ .Values.probes.readiness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.readiness.periodSeconds }}
+            failureThreshold: {{ .Values.probes.readiness.failureThreshold }}
+            timeoutSeconds: {{ .Values.probes.readiness.timeoutSeconds }}

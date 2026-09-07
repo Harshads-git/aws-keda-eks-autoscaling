@@ -1,0 +1,43 @@
+{{- if .Values.metricsService.enabled }}
+# Headless Service for Prometheus scraping — exposes each pod's :8080 directly
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "keda-demo.fullname" . }}-metrics
+  namespace: {{ include "keda-demo.namespace" . }}
+  labels:
+    {{- include "keda-demo.labels" . | nindent 4 }}
+    app: {{ include "keda-demo.fullname" . }}-consumer  # ServiceMonitor selector
+spec:
+  clusterIP: None   # Headless: DNS returns all pod IPs (not load-balanced)
+  selector:
+    {{- include "keda-demo.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: metrics
+      port: {{ .Values.metricsService.port }}
+      targetPort: {{ .Values.app.metricsPort }}
+      protocol: TCP
+
+---
+# ServiceMonitor: tells Prometheus Operator to scrape this Service
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "keda-demo.fullname" . }}-consumer
+  namespace: {{ include "keda-demo.namespace" . }}
+  labels:
+    {{- include "keda-demo.labels" . | nindent 4 }}
+    release: kube-prometheus-stack  # Must match Prometheus label selector
+spec:
+  selector:
+    matchLabels:
+      app: {{ include "keda-demo.fullname" . }}-consumer
+  namespaceSelector:
+    matchNames:
+      - {{ include "keda-demo.namespace" . }}
+  endpoints:
+    - port: metrics
+      path: /metrics
+      interval: 30s
+      scrapeTimeout: 10s
+{{- end }}

@@ -1,0 +1,48 @@
+{{- if .Values.keda.enabled }}
+---
+# TriggerAuthentication: grants KEDA permission to call SQS GetQueueAttributes
+# Uses pod identity (IRSA via projected ServiceAccount token) — no static AWS keys
+apiVersion: keda.sh/v1alpha1
+kind: TriggerAuthentication
+metadata:
+  name: {{ include "keda-demo.fullname" . }}-trigger-auth
+  namespace: {{ include "keda-demo.namespace" . }}
+  labels:
+    {{- include "keda-demo.labels" . | nindent 4 }}
+spec:
+  podIdentity:
+    provider: aws   # Use IRSA (AWS pod identity via OIDC)
+
+---
+# ScaledObject: the KEDA autoscaler brain
+# Watches SQS queue depth → drives HPA → controls Deployment replicas
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: {{ include "keda-demo.fullname" . }}-scaledobject
+  namespace: {{ include "keda-demo.namespace" . }}
+  labels:
+    {{- include "keda-demo.labels" . | nindent 4 }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "keda-demo.fullname" . }}
+
+  pollingInterval:  {{ .Values.keda.pollingInterval }}    # seconds between SQS polls
+  cooldownPeriod:   {{ .Values.keda.cooldownPeriod }}     # seconds before scale-down after scale-up
+  minReplicaCount:  {{ .Values.keda.minReplicaCount }}    # 0 = scale to zero
+  maxReplicaCount:  {{ .Values.keda.maxReplicaCount }}    # hard ceiling on pods
+
+  triggers:
+    - type: aws-sqs-queue
+      authenticationRef:
+        name: {{ include "keda-demo.fullname" . }}-trigger-auth
+      metadata:
+        queueURL:             {{ .Values.aws.sqsQueueUrl | quote }}
+        queueLength:          {{ .Values.keda.targetQueueLength | quote }}
+        awsRegion:            {{ .Values.aws.region | quote }}
+        identityOwner:        pod    # Pod provides its own IRSA token
+        scaleOnInFlight:      "true" # Count in-flight (invisible) messages too
+        scaleToZeroOnInvalidMetrics: {{ .Values.keda.scaleToZeroOnInvalidMetrics | quote }}
+{{- end }}
