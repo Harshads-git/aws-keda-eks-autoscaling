@@ -1,0 +1,139 @@
+---
+# manifests/rbac.yaml — Kubernetes RBAC for keda-demo
+# =============================================================================
+# RBAC (Role-Based Access Control) controls what the SERVICE ACCOUNT of each
+# pod can DO against the Kubernetes API server.
+#
+# This is separate from AWS IAM (which controls what the pod can do in AWS):
+#
+#   Kubernetes RBAC:   ServiceAccount → what the pod can do to K8s resources
+#   AWS IAM (IRSA):    ServiceAccount → what the pod can do in AWS (SQS, ECR)
+#
+# The consumer ServiceAccount needs minimal K8s API access — it only reads
+# its own ConfigMap. KEDA's operator ServiceAccount needs broader access to
+# manage HPA and watch Deployments.
+#
+# Least-privilege model:
+#   Consumer SA:  read-only access to its own ConfigMap in keda-demo namespace
+#   KEDA SA:      managed by KEDA Helm chart (we don't override it here)
+#   No cluster-admin: nobody gets wildcard permissions
+# =============================================================================
+
+# ── Role 1: Consumer Pod Role (Namespace-Scoped) ──────────────────────────────
+# The consumer pod's ServiceAccount can only:
+#   - Read its own ConfigMap (for dynamic config reload, if implemented)
+#   - Read its own Pod details (for self-identification in logs)
+# It CANNOT: create/delete anything, access other namespaces, or read secrets.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: keda-demo-consumer-role
+  namespace: keda-demo
+  labels:
+    app.kubernetes.io/name: keda-demo
+    app.kubernetes.io/component: consumer
+    app.kubernetes.io/managed-by: kubectl
+rules:
+  # Read ConfigMap (for potential hot-reload of config without pod restart)
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: ["keda-demo-config"]  # Only THIS specific ConfigMap
+    verbs: ["get", "watch", "list"]
+
+  # Read own Pod info (useful for self-identifying pod name in structured logs)
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get"]
+
+---
+# ── RoleBinding: Bind consumer Role to consumer ServiceAccount ─────────────────
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: keda-demo-consumer-rolebinding
+  namespace: keda-demo
+  labels:
+    app.kubernetes.io/name: keda-demo
+    app.kubernetes.io/component: consumer
+    app.kubernetes.io/managed-by: kubectl
+subjects:
+  - kind: ServiceAccount
+    name: keda-demo               # Matches manifests/serviceaccount.yaml
+    namespace: keda-demo
+roleRef:
+  kind: Role
+  name: keda-demo-consumer-role
+  apiGroup: rbac.authorization.k8s.io
+
+---
+# ── Role 2: Namespace Reader Role ─────────────────────────────────────────────
+# Allows monitoring tooling (Prometheus, external tools) to read resource state
+# in the keda-demo namespace. Read-only, no write permissions.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: keda-demo-namespace-reader
+  namespace: keda-demo
+  labels:
+    app.kubernetes.io/managed-by: kubectl
+rules:
+  - apiGroups: [""]
+    resources:
+      - pods
+      - services
+      - endpoints
+      - configmaps
+      - resourcequotas
+      - limitranges
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments", "replicasets"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["autoscaling"]
+    resources: ["horizontalpodautoscalers"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["policy"]
+    resources: ["poddisruptionbudgets"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies"]
+    verbs: ["get", "list", "watch"]
+
+---
+# ── ClusterRole: KEDA ScaledObject Viewer ─────────────────────────────────────
+# Allows any principal (developer, CI system) to READ KEDA ScaledObjects
+# across all namespaces. Read-only, cluster-scoped for KEDA CRDs.
+# Note: KEDA operator's own ClusterRole is managed by the KEDA Helm chart.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: keda-scaledobject-viewer
+  labels:
+    app.kubernetes.io/managed-by: kubectl
+    rbac.authorization.k8s.io/aggregate-to-view: "true"  # Aggregate into built-in 'view' role
+rules:
+  - apiGroups: ["keda.sh"]
+    resources:
+      - scaledobjects
+      - scaledjobs
+      - triggerauthentications
+      - clustertriggerauthentications
+    verbs: ["get", "list", "watch"]
+
+---
+# ── Audit: What the consumer ServiceAccount CANNOT do ──────────────────────────
+# This comment documents denied permissions for audit/review purposes.
+# The following would be DENIED by RBAC for the keda-demo ServiceAccount:
+#
+#   kubectl exec pod/<name>          ← cannot exec into other pods
+#   kubectl delete pod/<name>        ← cannot delete pods (even its own)
+#   kubectl get secrets              ← cannot read ANY secrets (important!)
+#   kubectl apply -f anything        ← cannot create/modify any resource
+#   kubectl get pods -n kube-system  ← cannot read other namespaces
+#   kubectl get nodes                ← cannot read node info
+#
+# Test with:
+#   kubectl auth can-i get secrets --as=system:serviceaccount:keda-demo:keda-demo -n keda-demo
+#   → no
+#   kubectl auth can-i get configmaps --as=system:serviceaccount:keda-demo:keda-demo -n keda-demo
+#   → yes

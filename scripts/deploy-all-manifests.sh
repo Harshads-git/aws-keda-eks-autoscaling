@@ -142,24 +142,31 @@ echo ""
 # Step 1: Namespace and ResourceQuota (foundation — everything else goes in here)
 apply_manifest \
   "${MANIFESTS_DIR}/namespace.yaml" \
-  "[1/6] Namespace: keda-demo + ResourceQuota"
+  "[1/7] Namespace: keda-demo + ResourceQuota"
 echo ""
 
-# Step 2: ServiceAccount with IRSA annotation
+# Step 2: RBAC (Role + RoleBinding for consumer ServiceAccount)
+# Must exist before Deployment — SA needs permissions before pods start
+apply_manifest \
+  "${MANIFESTS_DIR}/rbac.yaml" \
+  "[2/7] RBAC: Role + RoleBinding for consumer ServiceAccount"
+echo ""
+
+# Step 3: ServiceAccount with IRSA annotation
 # (must exist before Deployment uses serviceAccountName: keda-demo)
 apply_manifest \
   "${MANIFESTS_DIR}/serviceaccount.yaml" \
-  "[2/6] ServiceAccount: keda-demo (IRSA annotated)"
+  "[3/7] ServiceAccount: keda-demo (IRSA annotated)"
 echo ""
 
-# Step 3: ConfigMap with app configuration
+# Step 4: ConfigMap with app configuration
 # (must exist before Deployment references it via envFrom: configMapRef)
 apply_manifest \
   "${MANIFESTS_DIR}/configmap.yaml" \
-  "[3/6] ConfigMap: keda-demo-config (SQS URL, region, log level)"
+  "[4/7] ConfigMap: keda-demo-config (SQS URL, region, log level)"
 echo ""
 
-# Step 4: Deployment
+# Step 5: Deployment
 # (references ServiceAccount + ConfigMap, pulls image from ECR)
 apply_manifest \
   "${MANIFESTS_DIR}/deployment.yaml" \
