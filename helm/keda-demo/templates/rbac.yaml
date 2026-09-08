@@ -1,0 +1,55 @@
+{{- if .Values.rbac.create }}
+---
+# Consumer Role: minimal permissions for the consumer ServiceAccount
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "keda-demo.fullname" . }}-consumer-role
+  namespace: {{ include "keda-demo.namespace" . }}
+  labels:
+    {{- include "keda-demo.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: ["{{ include "keda-demo.fullname" . }}-config"]
+    verbs: ["get", "watch", "list"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "keda-demo.fullname" . }}-consumer-rolebinding
+  namespace: {{ include "keda-demo.namespace" . }}
+  labels:
+    {{- include "keda-demo.labels" . | nindent 4 }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "keda-demo.serviceAccountName" . }}
+    namespace: {{ include "keda-demo.namespace" . }}
+roleRef:
+  kind: Role
+  name: {{ include "keda-demo.fullname" . }}-consumer-role
+  apiGroup: rbac.authorization.k8s.io
+
+---
+# ClusterRole: allows viewing KEDA CRDs (ScaledObject, TriggerAuthentication)
+# Aggregated to the built-in 'view' ClusterRole for developer convenience
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "keda-demo.fullname" . }}-keda-viewer
+  labels:
+    {{- include "keda-demo.labels" . | nindent 4 }}
+    rbac.authorization.k8s.io/aggregate-to-view: "true"
+rules:
+  - apiGroups: ["keda.sh"]
+    resources:
+      - scaledobjects
+      - scaledjobs
+      - triggerauthentications
+      - clustertriggerauthentications
+    verbs: ["get", "list", "watch"]
+{{- end }}

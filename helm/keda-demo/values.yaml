@@ -73,6 +73,10 @@ serviceAccount:
   name: keda-demo
   annotations: {}      # IRSA annotation added automatically from aws.irsaRoleArn
 
+# ── RBAC ──────────────────────────────────────────────────────────────────────
+rbac:
+  create: true         # Create Role + RoleBinding + ClusterRole for KEDA viewer
+
 # ── Termination ────────────────────────────────────────────────────────────────
 terminationGracePeriodSeconds: 40  # Must exceed SQS visibility timeout (30s)
 
