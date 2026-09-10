@@ -1,0 +1,13 @@
+# ai/requirements.txt — Python dependencies for the AI predictor module
+#
+# Install: pip install -r ai/requirements.txt
+#
+# These are separate from application/requirements.txt to keep the consumer
+# image lightweight (scikit-learn adds ~100MB to the image).
+# The predictor runs as a SEPARATE sidecar/service, not inside the consumer.
+
+scikit-learn==1.4.2     # LinearRegression, r2_score
+numpy==1.26.4           # Array operations, feature engineering
+pandas==2.2.2           # (future) time-series DataFrame operations
+matplotlib==3.8.4       # (future) prediction vs actual plots for validation
+joblib==1.4.2           # Model serialization (sklearn.dump / sklearn.load)
