@@ -1,0 +1,71 @@
+# =============================================================================
+# helm/keda-demo/values-prod.yaml — Production Override Values
+# =============================================================================
+# Use with:
+#   helm upgrade --install keda-demo ./helm/keda-demo \
+#     -f helm/keda-demo/values-prod.yaml \
+#     --set image.tag=sha-<commit> \
+#     --set aws.sqsQueueUrl=<url> \
+#     --set aws.irsaRoleArn=<arn> \
+#     --set image.repository=<ecr-uri>
+#
+# Values here OVERRIDE defaults in values.yaml.
+# Only specify values that differ from the defaults.
+# =============================================================================
+
+# Production image: always a pinned commit SHA (never 'latest')
+image:
+  pullPolicy: Always    # Ensure exact SHA is pulled, not a cached layer
+
+# Production app config: minimal logging to reduce CloudWatch cost
+app:
+  logLevel: WARNING          # Only log errors and warnings (not INFO)
+  sqsWaitTimeSeconds: 20     # Full long-poll
+
+# Production KEDA: 1 warm pod always running, full scale ceiling
+keda:
+  minReplicaCount: 1         # Always 1 pod warm → zero cold-start latency
+  maxReplicaCount: 5         # Full scale ceiling
+  targetQueueLength: 5       # 1 pod per 5 queued messages
+  pollingInterval: 15
+  cooldownPeriod: 300        # 5-minute cooldown (prevents thrash on brief dips)
+
+# Production resources: higher request/limit for burst headroom
+resources:
+  requests:
+    cpu: "100m"
+    memory: "128Mi"
+  limits:
+    cpu: "500m"
+    memory: "256Mi"
+
+# Spot scheduling: enabled in production for cost savings
+spot:
+  enabled: true
+
+# All resilience features on in production
+podDisruptionBudget:
+  enabled: true
+
+networkPolicy:
+  enabled: true
+
+resourceQuota:
+  enabled: true
+  hard:
+    requestsCpu: "500m"
+    limitsCpu: "2500m"
+    requestsMemory: "640Mi"
+    limitsMemory: "1280Mi"
+    pods: "10"
+    persistentvolumeclaims: "0"
+
+metricsService:
+  enabled: true
+
+rbac:
+  create: true
+
+# Production terminationGracePeriodSeconds: same as default (40s)
+# Must be > sqsWaitTimeSeconds (20s) to allow in-flight message completion
+terminationGracePeriodSeconds: 40

@@ -1,0 +1,58 @@
+# =============================================================================
+# helm/keda-demo/values-staging.yaml — Staging Override Values
+# =============================================================================
+# Use with:
+#   helm upgrade --install keda-demo-staging ./helm/keda-demo \
+#     -f helm/keda-demo/values-staging.yaml \
+#     --set image.tag=sha-<commit> \
+#     --set aws.sqsQueueUrl=<staging-queue-url> \
+#     --set aws.irsaRoleArn=<staging-role-arn> \
+#     --set image.repository=<ecr-uri>
+#
+# Staging mirrors production settings except for:
+#   - maxReplicaCount: 3 (vs 5 in prod) — limits staging cost
+#   - minReplicaCount: 0 (scale-to-zero ok in staging to save cost)
+#   - LOG_LEVEL: INFO (vs WARNING in prod — more visibility for testing)
+#   - cooldownPeriod: 120s (vs 300s — faster iteration between tests)
+# =============================================================================
+
+image:
+  pullPolicy: Always    # Always pull pinned SHA tag in staging too
+
+app:
+  logLevel: INFO             # More visibility during testing vs prod's WARNING
+  sqsWaitTimeSeconds: 20
+
+keda:
+  minReplicaCount: 0         # Scale-to-zero OK in staging (cost control)
+  maxReplicaCount: 3         # Half of prod ceiling (staging rarely needs 5)
+  targetQueueLength: 5
+  pollingInterval: 15
+  cooldownPeriod: 120        # 2 minutes (faster than prod's 5min for test iteration)
+
+# Staging resources: same as prod (validates prod behavior)
+resources:
+  requests:
+    cpu: "100m"
+    memory: "128Mi"
+  limits:
+    cpu: "500m"
+    memory: "256Mi"
+
+spot:
+  enabled: true
+
+podDisruptionBudget:
+  enabled: true
+
+networkPolicy:
+  enabled: true
+
+resourceQuota:
+  enabled: true
+
+metricsService:
+  enabled: true
+
+rbac:
+  create: true
