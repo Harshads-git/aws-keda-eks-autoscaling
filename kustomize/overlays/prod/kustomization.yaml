@@ -1,0 +1,109 @@
+# =============================================================================
+# kustomize/overlays/prod/kustomization.yaml
+# Production environment overlay — full resource limits, max resilience.
+# =============================================================================
+# Production differences from base/dev/staging:
+#   - Exact pinned commit SHA image tag (never 'latest' in prod)
+#   - maxReplicaCount: 5 (full scale ceiling)
+#   - minReplicaCount: 1 (always 1 pod warm — no cold-start in production)
+#   - Resource limits: maximum allowed by ResourceQuota
+#   - LOG_LEVEL: WARNING (only actionable signals — reduces log storage cost)
+#   - cooldownPeriod: 300s (conservative — don't thrash on brief traffic dips)
+#   - topologySpreadConstraints already in deployment.yaml (enforced in prod)
+#
+# Apply:
+#   kubectl apply -k kustomize/overlays/prod/
+#
+# ALWAYS preview before applying in production:
+#   kubectl diff -k kustomize/overlays/prod/
+#
+# Rollback:
+#   kustomize edit set image keda-demo-app=<ecr>:<previous-sha>
+#   kubectl apply -k kustomize/overlays/prod/
+# =============================================================================
+
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../../base
+
+commonLabels:
+  environment: prod
+
+# NEVER use 'latest' in production.
+# Before deploying: kustomize edit set image keda-demo-app=<ecr-uri>:<sha>
+# The CD pipeline (cd.yml) updates this automatically on merge to main.
+images:
+  - name: keda-demo-app
+    newName: "REPLACE_WITH_ECR_REPO_URI"
+    newTag: "REPLACE_WITH_COMMIT_SHA"
+
+patches:
+  # ── Patch 1: Deployment — maximum allowed resources ───────────────────────
+  - target:
+      kind: Deployment
+      name: keda-demo
+    patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: keda-demo
+      spec:
+        template:
+          spec:
+            containers:
+              - name: app
+                resources:
+                  requests:
+                    cpu: "100m"      # Higher request in prod (guaranteed headroom)
+                    memory: "128Mi"
+                  limits:
+                    cpu: "500m"      # Burst ceiling (within LimitRange max)
+                    memory: "256Mi"
+
+  # ── Patch 2: ConfigMap — WARNING-only logging, max SQS wait ───────────────
+  - target:
+      kind: ConfigMap
+      name: keda-demo-config
+    patch: |-
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: keda-demo-config
+      data:
+        LOG_LEVEL: "WARNING"           # Only log actionable events in prod
+        SQS_WAIT_TIME_SECONDS: "20"    # Full long-poll to minimize SQS API calls
+
+  # ── Patch 3: ScaledObject — full scale, conservative cooldown ─────────────
+  - target:
+      kind: ScaledObject
+      name: keda-demo-scaledobject
+    patch: |-
+      apiVersion: keda.sh/v1alpha1
+      kind: ScaledObject
+      metadata:
+        name: keda-demo-scaledobject
+      spec:
+        minReplicaCount: 1            # Keep 1 pod warm (no cold-start in prod)
+        maxReplicaCount: 5            # Full scale ceiling
+        pollingInterval: 15           # Poll every 15s
+        cooldownPeriod: 300           # 5 minutes before scaling down
+        triggers:
+          - type: aws-sqs-queue
+            metadata:
+              queueLength: "5"        # 1 pod per 5 messages
+              awsRegion: "us-east-1"
+
+  # ── Patch 4: Deployment — add prod-specific annotations ───────────────────
+  - target:
+      kind: Deployment
+      name: keda-demo
+    patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: keda-demo
+        annotations:
+          deployment.kubernetes.io/environment: "production"
+          deployment.kubernetes.io/change-cause: "Deployed by GitHub Actions CD pipeline"

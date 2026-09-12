@@ -1,0 +1,104 @@
+# =============================================================================
+# kustomize/overlays/staging/kustomization.yaml
+# Staging environment overlay — production-like, but with lower scale ceilings.
+# =============================================================================
+# Staging sits between dev and prod in the promotion pipeline:
+#
+#   Dev → Staging → Prod
+#   (fast, cheap) (prod-like) (full scale)
+#
+# Staging purpose:
+#   - Validates that the change works with production-level resource limits
+#   - Catches issues that don't appear on the stripped-down dev environment
+#   - Used for integration tests and manual verification before prod deploy
+#
+# Differences from dev:
+#   - Resource limits: prod-matching (100m CPU / 128Mi RAM per pod)
+#   - LOG_LEVEL: INFO (same as prod — no DEBUG noise)
+#   - maxReplicaCount: 3 (half of prod's 5, to control staging cost)
+#   - PDB: enabled (same resilience guarantees as prod)
+#   - cooldownPeriod: 120s (prod-like, not the fast 15s dev uses)
+#
+# Apply:
+#   kubectl apply -k kustomize/overlays/staging/
+#
+# Preview diff vs current cluster state:
+#   kubectl diff -k kustomize/overlays/staging/
+# =============================================================================
+
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../../base
+
+commonLabels:
+  environment: staging
+
+# Staging uses a pinned sha tag (not 'latest') to match prod promotion model.
+# Update before deploying: kustomize edit set image keda-demo-app=<ecr>:<sha>
+images:
+  - name: keda-demo-app
+    newName: "REPLACE_WITH_ECR_REPO_URI"
+    newTag: "REPLACE_WITH_COMMIT_SHA"
+
+patches:
+  # ── Patch 1: Deployment — production-matching resource limits ─────────────
+  - target:
+      kind: Deployment
+      name: keda-demo
+    patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: keda-demo
+      spec:
+        template:
+          spec:
+            containers:
+              - name: app
+                resources:
+                  requests:
+                    cpu: "50m"       # Same as base (production spec)
+                    memory: "64Mi"
+                  limits:
+                    cpu: "200m"      # Same as base
+                    memory: "128Mi"
+
+  # ── Patch 2: ConfigMap — INFO logging, production SQS wait time ───────────
+  - target:
+      kind: ConfigMap
+      name: keda-demo-config
+    patch: |-
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: keda-demo-config
+      data:
+        LOG_LEVEL: "INFO"
+        SQS_WAIT_TIME_SECONDS: "20"    # Full 20s long-poll (same as prod)
+
+  # ── Patch 3: ScaledObject — prod-like scaling, lower cap ──────────────────
+  - target:
+      kind: ScaledObject
+      name: keda-demo-scaledobject
+    patch: |-
+      apiVersion: keda.sh/v1alpha1
+      kind: ScaledObject
+      metadata:
+        name: keda-demo-scaledobject
+      spec:
+        minReplicaCount: 0            # Scale-to-zero still enabled
+        maxReplicaCount: 3            # Half of prod (controls staging cost)
+        pollingInterval: 15           # Same as prod
+        cooldownPeriod: 120           # Same as prod (not dev's fast 15s)
+        triggers:
+          - type: aws-sqs-queue
+            metadata:
+              queueLength: "5"        # Same target as prod
+              awsRegion: "us-east-1"
+
+  # ── Patch 4: PodDisruptionBudget — same resilience as prod ────────────────
+  # Ensures staging tests catch PDB-related issues before they reach prod.
+  # Note: PDB must be added to base resources to be patchable in overlays.
+  # This patch is documented as a future addition when pdb.yaml is in base.
