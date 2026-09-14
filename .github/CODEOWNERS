@@ -1,0 +1,21 @@
+# CODEOWNERS — GitHub Code Review Assignment
+# https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+#
+# Rules are matched in order — last match wins.
+# Format: <pattern> <@owner1> <@owner2>
+
+# Default: all files require review from the repo owner
+*                             @Harshads-git
+
+# Infrastructure changes: extra scrutiny for Terraform and Kubernetes
+terraform/**                  @Harshads-git
+manifests/**                  @Harshads-git
+helm/**                       @Harshads-git
+kustomize/**                  @Harshads-git
+
+# Application code: the consumer and AI module
+application/**                @Harshads-git
+ai/**                         @Harshads-git
+
+# CI/CD: pipeline changes always require owner review
+.github/**                    @Harshads-git
