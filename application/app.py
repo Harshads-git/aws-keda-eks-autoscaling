@@ -156,6 +156,7 @@ def load_config() -> dict[str, Any]:
         "health_file":        os.environ.get("HEALTH_FILE", "/tmp/healthy"),
         "shutdown_timeout":   int(os.environ.get("SHUTDOWN_TIMEOUT_SECONDS", "30")),
         "metrics_port":       int(os.environ.get("METRICS_PORT", "8080")),
+        "endpoint_url":       os.environ.get("AWS_ENDPOINT_URL", "").strip() or None,
     }
 
 
@@ -213,8 +214,10 @@ def process_message(message: dict[str, Any], logger: logging.Logger, queue_url: 
             extra={"message_id": message_id, "body": body},
         )
 
-        # Simulate brief processing time (remove in real implementations)
-        time.sleep(0.1)
+        # Simulate processing time (configurable via env var for demonstrations)
+        delay = float(os.environ.get("PROCESSING_DELAY_SECONDS", "2.0"))
+        if delay > 0:
+            time.sleep(delay)
 
         duration_s = time.monotonic() - start_time
         duration_ms = round(duration_s * 1000, 2)
@@ -284,8 +287,11 @@ class SQSConsumer:
 
         # Create the boto3 SQS client
         # IRSA: credentials come from projected ServiceAccount token via STS
-        # No AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY needed
-        self.sqs = boto3.client("sqs", region_name=config["aws_region"])
+        # If AWS_ENDPOINT_URL is set, connects to local SQS / LocalStack emulator
+        client_kwargs = {"region_name": config["aws_region"]}
+        if config.get("endpoint_url"):
+            client_kwargs["endpoint_url"] = config["endpoint_url"]
+        self.sqs = boto3.client("sqs", **client_kwargs)
 
     def _setup_signal_handlers(self) -> None:
         """
