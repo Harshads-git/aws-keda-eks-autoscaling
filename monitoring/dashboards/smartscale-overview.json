@@ -1,0 +1,269 @@
+{
+  "__inputs": [
+    {
+      "name": "DS_PROMETHEUS",
+      "label": "Prometheus",
+      "description": "Prometheus data source for SmartScale AI metrics",
+      "type": "datasource",
+      "pluginId": "prometheus",
+      "pluginName": "Prometheus"
+    }
+  ],
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": "-- Grafana --",
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "description": "SmartScale AI — Real-time event-driven autoscaling overview",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "liveNow": false,
+  "panels": [
+    {
+      "title": "📊 Queue & Scaling Overview",
+      "type": "row",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
+      "collapsed": false
+    },
+    {
+      "title": "SQS Queue Depth (Live)",
+      "description": "ApproximateNumberOfMessages from SQS. KEDA scales pods based on this value.\nFormula: desiredReplicas = ceil(depth / targetQueueLength)\ntargetQueueLength = 5 in our config.",
+      "type": "timeseries",
+      "datasource": "${DS_PROMETHEUS}",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "axisLabel": "Messages",
+            "drawStyle": "line",
+            "fillOpacity": 20,
+            "gradientMode": "scheme",
+            "lineWidth": 2,
+            "pointSize": 5,
+            "showPoints": "auto",
+            "spanNulls": true
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 10 },
+              { "color": "red", "value": 20 }
+            ]
+          },
+          "unit": "short"
+        }
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 1 },
+      "targets": [
+        {
+          "expr": "keda_queue_depth{queue_name=\"keda-demo-queue\"}",
+          "legendFormat": "Queue Depth",
+          "refId": "A"
+        },
+        {
+          "expr": "keda_queue_depth{queue_name=\"keda-demo-queue\"} / 5",
+          "legendFormat": "Expected Pods (depth/5)",
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "title": "Active Consumer Pods",
+      "description": "Number of keda-demo pods currently Running.\nShould match ceil(queue_depth / 5).\n0 pods = scale-to-zero active (no idle cost).",
+      "type": "gauge",
+      "datasource": "${DS_PROMETHEUS}",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "max": 5,
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "blue", "value": null },
+              { "color": "green", "value": 1 },
+              { "color": "yellow", "value": 4 },
+              { "color": "red", "value": 5 }
+            ]
+          },
+          "unit": "short"
+        }
+      },
+      "gridPos": { "h": 8, "w": 6, "x": 12, "y": 1 },
+      "targets": [
+        {
+          "expr": "count(kube_pod_status_phase{namespace=\"keda-demo\", pod=~\"keda-demo-.*\", phase=\"Running\"}) or vector(0)",
+          "legendFormat": "Running Pods",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "title": "HPA: Desired vs Actual Replicas",
+      "description": "Dual-axis chart showing what KEDA wants (desired) vs what is running (current).\nA gap between lines = scaling lag (pods starting up or shutting down).",
+      "type": "timeseries",
+      "datasource": "${DS_PROMETHEUS}",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "axisLabel": "Replicas",
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 2,
+            "spanNulls": true
+          },
+          "unit": "short"
+        }
+      },
+      "gridPos": { "h": 8, "w": 6, "x": 18, "y": 1 },
+      "targets": [
+        {
+          "expr": "kube_horizontalpodautoscaler_status_desired_replicas{horizontalpodautoscaler=~\"keda-hpa-keda-demo.*\"}",
+          "legendFormat": "Desired (KEDA target)",
+          "refId": "A"
+        },
+        {
+          "expr": "kube_horizontalpodautoscaler_status_current_replicas{horizontalpodautoscaler=~\"keda-hpa-keda-demo.*\"}",
+          "legendFormat": "Current (actual running)",
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "title": "⏱ Processing Latency & Throughput",
+      "type": "row",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 9 },
+      "collapsed": false
+    },
+    {
+      "title": "Processing Latency (P50 / P95 / P99)",
+      "description": "Message processing time percentiles from the Prometheus histogram.\nP99 SLO target: ≤ 5 seconds.\nIf P99 > 5s, check:\n  1. Run performance_test.py (is Python the bottleneck?)\n  2. Check SQS receive latency (network issue?)\n  3. Check pod CPU throttling (increase resource limits)",
+      "type": "timeseries",
+      "datasource": "${DS_PROMETHEUS}",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "axisLabel": "Latency",
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "lineWidth": 2,
+            "spanNulls": true
+          },
+          "unit": "s"
+        }
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 10 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum(rate(keda_demo_message_processing_duration_seconds_bucket[5m])) by (le))",
+          "legendFormat": "P50 (median)",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(keda_demo_message_processing_duration_seconds_bucket[5m])) by (le))",
+          "legendFormat": "P95",
+          "refId": "B"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum(rate(keda_demo_message_processing_duration_seconds_bucket[5m])) by (le))",
+          "legendFormat": "P99 (SLO ≤ 5s)",
+          "refId": "C"
+        }
+      ]
+    },
+    {
+      "title": "Messages Processed vs Failed",
+      "description": "Rate of successfully processed messages vs failures.\nSLO target: error rate < 1%.\nFailures trigger SQS visibility timeout → message redelivery.\nAfter 3 failures → message goes to Dead Letter Queue.",
+      "type": "timeseries",
+      "datasource": "${DS_PROMETHEUS}",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "axisLabel": "msg/sec",
+            "drawStyle": "bars",
+            "fillOpacity": 80,
+            "lineWidth": 1,
+            "stacking": { "group": "A", "mode": "normal" }
+          },
+          "unit": "short"
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "Failed" },
+            "properties": [
+              { "id": "color", "value": { "fixedColor": "red", "mode": "fixed" } }
+            ]
+          }
+        ]
+      },
+      "gridPos": { "h": 8, "w": 6, "x": 12, "y": 10 },
+      "targets": [
+        {
+          "expr": "sum(rate(keda_demo_messages_processed_total[5m]))",
+          "legendFormat": "Processed",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(rate(keda_demo_messages_failed_total[5m]))",
+          "legendFormat": "Failed",
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "title": "Error Rate %",
+      "description": "Percentage of messages that failed processing.\nSLO: < 1% error rate.\nGreen: < 1% | Yellow: 1-5% | Red: > 5%\nAlert: KedaDemoHighFailureRate fires at ≥ 1% for 5 minutes.",
+      "type": "stat",
+      "datasource": "${DS_PROMETHEUS}",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 1 },
+              { "color": "red", "value": 5 }
+            ]
+          },
+          "unit": "percent",
+          "decimals": 2
+        }
+      },
+      "gridPos": { "h": 8, "w": 6, "x": 18, "y": 10 },
+      "targets": [
+        {
+          "expr": "100 * sum(rate(keda_demo_messages_failed_total[5m])) / (sum(rate(keda_demo_messages_processed_total[5m])) + sum(rate(keda_demo_messages_failed_total[5m])) + 0.001)",
+          "legendFormat": "Error Rate",
+          "refId": "A"
+        }
+      ]
+    }
+  ],
+  "refresh": "5s",
+  "schemaVersion": 38,
+  "style": "dark",
+  "tags": ["smartscale-ai", "keda", "sqs", "autoscaling"],
+  "templating": { "list": [] },
+  "time": { "from": "now-30m", "to": "now" },
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "SmartScale AI — Overview",
+  "uid": "smartscale-overview",
+  "version": 1
+}
