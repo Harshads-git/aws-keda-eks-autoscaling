@@ -1,0 +1,143 @@
+# =============================================================================
+# monitoring/alertmanager-config.yaml — Alertmanager Notification Routing
+# =============================================================================
+# Configures Alertmanager to send SmartScale AI alerts to Slack or Discord.
+#
+# How Alertmanager routing works:
+#   1. Prometheus evaluates PrometheusRules (7 rules defined in manifests/)
+#   2. When a rule fires, Prometheus sends the alert to Alertmanager
+#   3. Alertmanager groups alerts by severity, deduplicates, waits for group_wait
+#   4. Alertmanager sends the notification to the matching receiver (Slack/Discord)
+#
+# Discord trick: Discord supports Slack-compatible webhooks by appending /slack
+#   to the webhook URL: https://discord.com/api/webhooks/ID/TOKEN/slack
+#
+# Setup:
+#   1. Create a Slack incoming webhook OR Discord webhook
+#   2. Replace WEBHOOK_URL_HERE with your actual URL
+#   3. Apply as a Kubernetes Secret (Alertmanager reads config from a Secret)
+#
+# Usage:
+#   kubectl create secret generic alertmanager-config \
+#     --from-file=alertmanager.yaml=monitoring/alertmanager-config.yaml \
+#     --namespace monitoring --dry-run=client -o yaml | kubectl apply -f -
+# =============================================================================
+
+# ─── Global Configuration ─────────────────────────────────────────────────────
+global:
+  # resolve_timeout: how long Alertmanager waits after an alert stops firing
+  # before sending a "resolved" notification
+  resolve_timeout: 5m
+
+  # Slack API URL (set here or per-receiver)
+  # For Discord: use https://discord.com/api/webhooks/YOUR_ID/YOUR_TOKEN/slack
+  slack_api_url: "WEBHOOK_URL_HERE"
+
+# ─── Notification Templates ──────────────────────────────────────────────────
+templates:
+  - "/etc/alertmanager/templates/*.tmpl"
+
+# ─── Routing Tree ──────────────────────────────────────────────────────────────
+# Alerts flow through the routing tree from top to bottom.
+# The first matching route determines the receiver.
+route:
+  # Default receiver for unmatched alerts
+  receiver: "smartscale-slack"
+
+  # group_by: alerts with the same labels are grouped into one notification
+  # Without grouping: 5 pods failing = 5 separate messages (noisy)
+  # With grouping: 5 pods failing = 1 message with "5 instances"
+  group_by: ["alertname", "namespace", "severity"]
+
+  # group_wait: how long to wait before sending the first notification
+  # for a new alert group (allows more alerts to arrive and be batched)
+  group_wait: 30s
+
+  # group_interval: how long to wait before sending updates for an
+  # existing alert group (prevents notification spam)
+  group_interval: 5m
+
+  # repeat_interval: how long before re-sending a notification for an
+  # alert that is still firing (reminder)
+  repeat_interval: 4h
+
+  # Child routes: match specific alert severities
+  routes:
+    # Critical alerts: send immediately with shorter repeat
+    - match:
+        severity: critical
+      receiver: "smartscale-slack-critical"
+      group_wait: 10s
+      repeat_interval: 1h
+
+    # Warning alerts: standard timing
+    - match:
+        severity: warning
+      receiver: "smartscale-slack"
+
+    # Info alerts: longer wait, less frequent repeats
+    - match:
+        severity: info
+      receiver: "smartscale-slack"
+      group_wait: 1m
+      repeat_interval: 12h
+
+# ─── Inhibition Rules ─────────────────────────────────────────────────────────
+# Suppress lower-severity alerts when a higher-severity alert is already firing
+# for the same alertname and namespace.
+#
+# Example: if KedaDemoConsumerDown (critical) is firing,
+#          suppress KedaDemoSlowProcessing (warning) for the same namespace
+#          because slow processing is expected when the consumer is down.
+inhibit_rules:
+  - source_match:
+      severity: critical
+    target_match:
+      severity: warning
+    equal: ["alertname", "namespace"]
+
+# ─── Receivers ─────────────────────────────────────────────────────────────────
+receivers:
+  # Default Slack/Discord channel for warning and info alerts
+  - name: "smartscale-slack"
+    slack_configs:
+      - channel: "#smartscale-alerts"
+        send_resolved: true
+        title: >-
+          {{ if eq .Status "firing" }}🔥{{ else }}✅{{ end }}
+          [{{ .Status | toUpper }}] {{ .CommonLabels.alertname }}
+        text: >-
+          *Severity:* {{ .CommonLabels.severity }}
+          *Namespace:* {{ .CommonLabels.namespace }}
+          *Description:* {{ .CommonAnnotations.description }}
+          *Runbook:* {{ .CommonAnnotations.runbook_url }}
+
+          {{ range .Alerts }}
+          • {{ .Labels.pod }}: {{ .Annotations.summary }}
+          {{ end }}
+
+          *Dashboard:* <http://localhost:3000/d/smartscale-overview|SmartScale Overview>
+        color: >-
+          {{ if eq .Status "firing" }}{{ if eq .CommonLabels.severity "critical" }}#FF0000{{ else }}#FFA500{{ end }}{{ else }}#00FF00{{ end }}
+
+  # Critical alerts: separate channel with @here mention
+  - name: "smartscale-slack-critical"
+    slack_configs:
+      - channel: "#smartscale-critical"
+        send_resolved: true
+        title: >-
+          🚨 [CRITICAL] {{ .CommonLabels.alertname }}
+        text: >-
+          <!here> *CRITICAL ALERT — Immediate action required*
+
+          *Severity:* CRITICAL
+          *Namespace:* {{ .CommonLabels.namespace }}
+          *Description:* {{ .CommonAnnotations.description }}
+
+          {{ range .Alerts }}
+          • {{ .Labels.pod }}: {{ .Annotations.summary }}
+          {{ end }}
+
+          *Runbook:* {{ .CommonAnnotations.runbook_url }}
+          *Dashboard:* <http://localhost:3000/d/smartscale-overview|SmartScale Overview>
+        color: "#FF0000"
