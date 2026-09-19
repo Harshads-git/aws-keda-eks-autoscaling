@@ -57,6 +57,13 @@ def setup_logging(level: str = "INFO") -> logging.Logger:
       | filter level = "ERROR"
       | sort @timestamp desc
 
+    Every log line includes Kubernetes pod metadata (injected via Downward API
+    or environment variables) so logs from multiple pods can be correlated:
+      - pod_name:  which specific pod produced this log
+      - node_name: which node the pod is running on
+      - namespace: the Kubernetes namespace
+      - trace_id:  unique ID per message for request tracing
+
     GCP equivalent: Cloud Logging structured log format
     """
     logger = logging.getLogger("keda-demo")
@@ -72,7 +79,52 @@ def setup_logging(level: str = "INFO") -> logging.Logger:
     )
     handler.setFormatter(formatter)
     logger.addHandler(handler)
+
+    # Inject pod metadata into every log line via a filter
+    logger.addFilter(PodMetadataFilter())
+
     return logger
+
+
+class PodMetadataFilter(logging.Filter):
+    """
+    Logging filter that injects Kubernetes pod metadata into every log record.
+
+    Metadata sources (set via Kubernetes Downward API in the Deployment):
+      env:
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+
+    Why this matters:
+      Without pod metadata, logs from 5 consumer pods are indistinguishable.
+      With pod metadata, you can filter: 'show me all logs from pod keda-demo-xyz'
+      or correlate: 'all logs from the same node that had a network issue'.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.pod_name = os.environ.get("POD_NAME", os.environ.get("HOSTNAME", "unknown"))
+        self.node_name = os.environ.get("NODE_NAME", "unknown")
+        self.namespace = os.environ.get("POD_NAMESPACE", os.environ.get("NAMESPACE", "unknown"))
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.pod_name = self.pod_name  # type: ignore[attr-defined]
+        record.node_name = self.node_name  # type: ignore[attr-defined]
+        record.namespace = self.namespace  # type: ignore[attr-defined]
+        # trace_id is set per-message in process_message(); default to empty
+        if not hasattr(record, "trace_id"):
+            record.trace_id = ""  # type: ignore[attr-defined]
+        return True
 
 
 # ─── Prometheus Metrics ───────────────────────────────────────────────────────
@@ -192,12 +244,19 @@ def process_message(message: dict[str, Any], logger: logging.Logger, queue_url: 
     attributes   = message.get("Attributes", {})
     receive_count = int(attributes.get("ApproximateReceiveCount", 1))
 
+    # Generate a trace_id for correlating all logs from this message processing.
+    # In production with OpenTelemetry, this would come from the trace context.
+    # For now, we derive it from the message_id to keep it deterministic and short.
+    import hashlib
+    trace_id = hashlib.md5(f"{message_id}-{receive_count}".encode()).hexdigest()[:12]
+
     start_time = time.monotonic()
 
     logger.info(
         "Processing message",
         extra={
             "message_id":    message_id,
+            "trace_id":      trace_id,
             "receive_count": receive_count,
             "body_length":   len(body),
         },
