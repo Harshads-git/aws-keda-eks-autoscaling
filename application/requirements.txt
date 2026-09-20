@@ -16,3 +16,23 @@ python-json-logger==2.0.7
 # Exposes /metrics on :8080 — scraped by Prometheus via ServiceMonitor
 # Also used by: manifests/network-policy.yaml (allow :8080 from monitoring ns)
 prometheus-client==0.20.0
+
+# ─── OpenTelemetry Distributed Tracing (Day 34) ─────────────────────────────
+# Provides end-to-end request tracing across the SQS consumer pipeline.
+# Each message gets a trace with child spans: receive → process → delete.
+#
+# Why OpenTelemetry over AWS X-Ray SDK:
+#   OTel is vendor-neutral (works with Jaeger, Zipkin, Tempo, X-Ray)
+#   X-Ray SDK locks you into AWS. OTel can export to X-Ray via OTLP if needed.
+#   OTel is CNCF graduated — same foundation as Kubernetes and Prometheus.
+
+# Core SDK: tracer, span context, propagation
+opentelemetry-api==1.25.0
+opentelemetry-sdk==1.25.0
+
+# OTLP exporter: sends traces to any OTLP-compatible backend
+# (Jaeger, Tempo, OpenTelemetry Collector, AWS X-Ray via ADOT)
+opentelemetry-exporter-otlp-proto-grpc==1.25.0
+
+# Auto-instrumentation for boto3/botocore (SQS calls get spans automatically)
+opentelemetry-instrumentation-botocore==0.46b0
