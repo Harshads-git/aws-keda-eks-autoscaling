@@ -1,0 +1,265 @@
+# =============================================================================
+# monitoring/otel-collector.yaml — OpenTelemetry Collector + Jaeger Backend
+# =============================================================================
+# Deploys the OpenTelemetry Collector as a central trace pipeline and Jaeger
+# as the trace visualization backend.
+#
+# Architecture:
+#   Consumer Pods ──(gRPC:4317)──▶ OTel Collector ──(gRPC:14250)──▶ Jaeger
+#       │                              │
+#       └── Traces with spans          └── Receives, processes, exports
+#           for each SQS message           traces to Jaeger for UI visualization
+#
+# Why an OTel Collector between app and Jaeger:
+#   1. Decoupling: app doesn't need to know about Jaeger directly
+#   2. Processing: can sample, filter, and batch traces before export
+#   3. Fan-out: can export to multiple backends (Jaeger + X-Ray + Tempo)
+#   4. Resilience: collector buffers traces if Jaeger is temporarily down
+#
+# Access Jaeger UI:
+#   kubectl port-forward -n monitoring svc/jaeger 16686:16686 &
+#   Open: http://localhost:16686
+# =============================================================================
+
+---
+# ── Jaeger All-in-One Deployment ─────────────────────────────────────────────
+# Jaeger "all-in-one" bundles collector, query, and UI in a single container.
+# Uses in-memory storage (traces lost on restart — fine for development).
+# For production: use Jaeger with Elasticsearch or Cassandra backend.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: jaeger
+  namespace: monitoring
+  labels:
+    app: jaeger
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: jaeger
+  template:
+    metadata:
+      labels:
+        app: jaeger
+    spec:
+      containers:
+        - name: jaeger
+          image: jaegertracing/all-in-one:1.57
+          ports:
+            # gRPC: receives traces from OTel Collector
+            - containerPort: 14250
+              name: grpc-model
+            # HTTP: Jaeger UI for trace visualization
+            - containerPort: 16686
+              name: ui
+            # HTTP: Jaeger health check
+            - containerPort: 14269
+              name: admin
+          env:
+            # In-memory storage (no persistence, fast startup)
+            - name: SPAN_STORAGE_TYPE
+              value: "memory"
+            # Max traces to keep in memory (prevents OOM)
+            - name: MEMORY_MAX_TRACES
+              value: "10000"
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 200m
+              memory: 512Mi
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 14269
+            initialDelaySeconds: 5
+            periodSeconds: 10
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: jaeger
+  namespace: monitoring
+  labels:
+    app: jaeger
+spec:
+  selector:
+    app: jaeger
+  ports:
+    - name: grpc-model
+      port: 14250
+      targetPort: 14250
+    - name: ui
+      port: 16686
+      targetPort: 16686
+
+---
+# ── OpenTelemetry Collector ConfigMap ────────────────────────────────────────
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: otel-collector-config
+  namespace: monitoring
+data:
+  otel-config.yaml: |
+    # ── Receivers: how traces enter the collector ──────────────────────────
+    receivers:
+      # OTLP receiver: accepts traces from applications via gRPC and HTTP
+      otlp:
+        protocols:
+          grpc:
+            endpoint: "0.0.0.0:4317"
+          http:
+            endpoint: "0.0.0.0:4318"
+
+    # ── Processors: transform traces before export ─────────────────────────
+    processors:
+      # Batch processor: groups spans before export (reduces network calls)
+      batch:
+        # send_batch_size: export when this many spans are buffered
+        send_batch_size: 1024
+        # timeout: export after this duration even if batch isn't full
+        timeout: 5s
+
+      # Memory limiter: prevents collector from using too much memory
+      # Important for free-tier nodes with limited RAM
+      memory_limiter:
+        # check_interval: how often to check memory usage
+        check_interval: 5s
+        # limit_mib: hard memory limit (collector drops data if exceeded)
+        limit_mib: 256
+        # spike_limit_mib: how much memory a sudden spike can use
+        spike_limit_mib: 64
+
+      # Resource processor: add/modify resource attributes on all traces
+      resource:
+        attributes:
+          - key: "cluster.name"
+            value: "keda-demo-dev-cluster"
+            action: upsert
+          - key: "cloud.provider"
+            value: "aws"
+            action: upsert
+
+    # ── Exporters: where processed traces are sent ─────────────────────────
+    exporters:
+      # Jaeger exporter: sends traces to Jaeger for UI visualization
+      otlp/jaeger:
+        endpoint: "jaeger.monitoring.svc.cluster.local:14250"
+        tls:
+          insecure: true
+
+      # Debug exporter: logs a sample of spans to collector stdout
+      # Useful for verifying traces are flowing through the pipeline
+      debug:
+        verbosity: basic
+        sampling_initial: 5
+        sampling_thereafter: 200
+
+    # ── Extensions: operational features ───────────────────────────────────
+    extensions:
+      # Health check: /healthz endpoint for liveness probes
+      health_check:
+        endpoint: "0.0.0.0:13133"
+      # zPages: debug pages at /debug/tracez and /debug/servicez
+      zpages:
+        endpoint: "0.0.0.0:55679"
+
+    # ── Service: wires receivers → processors → exporters ──────────────────
+    service:
+      extensions: [health_check, zpages]
+      pipelines:
+        traces:
+          receivers: [otlp]
+          processors: [memory_limiter, resource, batch]
+          exporters: [otlp/jaeger, debug]
+
+---
+# ── OpenTelemetry Collector Deployment ───────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: otel-collector
+  namespace: monitoring
+  labels:
+    app: otel-collector
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: otel-collector
+  template:
+    metadata:
+      labels:
+        app: otel-collector
+    spec:
+      containers:
+        - name: otel-collector
+          image: otel/opentelemetry-collector-contrib:0.102.0
+          args:
+            - "--config=/conf/otel-config.yaml"
+          ports:
+            # gRPC: receives traces from applications
+            - containerPort: 4317
+              name: otlp-grpc
+            # HTTP: alternative trace ingestion
+            - containerPort: 4318
+              name: otlp-http
+            # Health check endpoint
+            - containerPort: 13133
+              name: health
+            # zPages debug UI
+            - containerPort: 55679
+              name: zpages
+          volumeMounts:
+            - name: config
+              mountPath: /conf
+          resources:
+            requests:
+              cpu: 25m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 256Mi
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 13133
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 13133
+            initialDelaySeconds: 5
+            periodSeconds: 15
+      volumes:
+        - name: config
+          configMap:
+            name: otel-collector-config
+
+---
+# ── OTel Collector Service ───────────────────────────────────────────────────
+apiVersion: v1
+kind: Service
+metadata:
+  name: otel-collector
+  namespace: monitoring
+  labels:
+    app: otel-collector
+spec:
+  selector:
+    app: otel-collector
+  ports:
+    - name: otlp-grpc
+      port: 4317
+      targetPort: 4317
+    - name: otlp-http
+      port: 4318
+      targetPort: 4318
+    - name: health
+      port: 13133
+      targetPort: 13133
