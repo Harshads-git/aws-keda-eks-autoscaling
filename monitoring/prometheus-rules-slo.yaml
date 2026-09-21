@@ -1,0 +1,191 @@
+---
+# monitoring/prometheus-rules-slo.yaml — PrometheusRule: Multi-Window Multi-Burn-Rate Alerts
+# =============================================================================
+# Implements Google SRE Workbook (Chapter 5) alerting on Service Level Objectives.
+#
+# Core Principles:
+#   1. Alert on symptoms (budget consumption), not causes.
+#   2. Multi-window: requires BOTH a long window (e.g. 1h) and a short window (e.g. 5m)
+#      to exceed the burn rate threshold before firing.
+#      - Long window ensures sufficient error budget is actually consumed.
+#      - Short window ensures the alert resets promptly when the incident ends,
+#        preventing alert flapping and prolonged pages.
+#
+# SLO Specifications for SmartScale AI:
+#   - Availability Target: 99.0% (1.0% error budget over 30 days)
+#   - Latency Target: 99.0% of messages processed in <= 5.0 seconds
+#
+# Burn Rate Matrix (30-Day Window, 1.0% Error Budget):
+#   - 14.4x burn rate = 2% budget consumed in 1 hour  (Critical / Page)
+#   - 6.0x  burn rate = 5% budget consumed in 6 hours (Warning / Ticket)
+#   - 3.0x  burn rate = 10% budget consumed in 24 hours (Warning / Daily)
+#   - 1.0x  burn rate = 10% budget consumed in 3 days (Info / Weekly)
+#
+# To apply:
+#   kubectl apply -f monitoring/prometheus-rules-slo.yaml
+# =============================================================================
+
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: keda-demo-slo-rules
+  namespace: keda-demo
+  labels:
+    release: kube-prometheus-stack
+    app.kubernetes.io/managed-by: kubectl
+    role: alert-rules
+spec:
+  groups:
+    - name: keda-demo.slo.availability
+      interval: 30s
+      rules:
+        # ─── 1. Critical Fast Burn (1h / 5m at 14.4x) ───────────────────────────
+        # Consumes 2% of the error budget in 1 hour.
+        # Requires both 1h and 5m windows to be burning at >= 14.4x rate.
+        - alert: KedaDemoSLOAvailabilityFastBurnCritical
+          expr: |
+            (
+              (
+                (sum(rate(keda_demo_messages_failed_total[1h])) or vector(0))
+                /
+                (sum(rate(keda_demo_messages_processed_total[1h])) + sum(rate(keda_demo_messages_failed_total[1h])) + 0.0001)
+              ) > (14.4 * 0.01)
+            )
+            and
+            (
+              (
+                (sum(rate(keda_demo_messages_failed_total[5m])) or vector(0))
+                /
+                (sum(rate(keda_demo_messages_processed_total[5m])) + sum(rate(keda_demo_messages_failed_total[5m])) + 0.0001)
+              ) > (14.4 * 0.01)
+            )
+          for: 2m
+          labels:
+            severity: critical
+            team: platform
+            tier: slo
+            alert_type: burn-rate
+          annotations:
+            summary: "High availability burn rate (14.4x) — 2% error budget consumed in 1 hour"
+            description: |
+              The SQS message processing error rate is consuming the 30-day error budget
+              at 14.4x normal speed. At this rate, the entire monthly error budget will be
+              exhausted in less than 2 days.
+            runbook_url: "https://github.com/Harshads-git/aws-keda-eks-autoscaling/blob/main/docs/slo-guide.md#remediating-fast-burn-critical"
+            dashboard_url: "http://localhost:3000/d/smartscale-slo-burn-rate"
+
+        # ─── 2. Warning Slow Burn (6h / 30m at 6.0x) ────────────────────────────
+        # Consumes 5% of the error budget in 6 hours.
+        # Requires both 6h and 30m windows to be burning at >= 6.0x rate.
+        - alert: KedaDemoSLOAvailabilitySlowBurnWarning
+          expr: |
+            (
+              (
+                (sum(rate(keda_demo_messages_failed_total[6h])) or vector(0))
+                /
+                (sum(rate(keda_demo_messages_processed_total[6h])) + sum(rate(keda_demo_messages_failed_total[6h])) + 0.0001)
+              ) > (6.0 * 0.01)
+            )
+            and
+            (
+              (
+                (sum(rate(keda_demo_messages_failed_total[30m])) or vector(0))
+                /
+                (sum(rate(keda_demo_messages_processed_total[30m])) + sum(rate(keda_demo_messages_failed_total[30m])) + 0.0001)
+              ) > (6.0 * 0.01)
+            )
+          for: 15m
+          labels:
+            severity: warning
+            team: platform
+            tier: slo
+            alert_type: burn-rate
+          annotations:
+            summary: "Moderate availability burn rate (6.0x) — 5% error budget consumed in 6 hours"
+            description: |
+              The error rate has maintained a 6.0x burn rate over a 6-hour window.
+              Requires developer triage to prevent exhaustion of monthly error budget.
+            runbook_url: "https://github.com/Harshads-git/aws-keda-eks-autoscaling/blob/main/docs/slo-guide.md#remediating-slow-burn-warning"
+            dashboard_url: "http://localhost:3000/d/smartscale-slo-burn-rate"
+
+        # ─── 3. Warning Sustained Burn (24h / 2h at 3.0x) ────────────────────────
+        # Consumes 10% of the error budget in 24 hours.
+        - alert: KedaDemoSLOAvailabilitySustainedBurnWarning
+          expr: |
+            (
+              (
+                (sum(rate(keda_demo_messages_failed_total[24h])) or vector(0))
+                /
+                (sum(rate(keda_demo_messages_processed_total[24h])) + sum(rate(keda_demo_messages_failed_total[24h])) + 0.0001)
+              ) > (3.0 * 0.01)
+            )
+            and
+            (
+              (
+                (sum(rate(keda_demo_messages_failed_total[2h])) or vector(0))
+                /
+                (sum(rate(keda_demo_messages_processed_total[2h])) + sum(rate(keda_demo_messages_failed_total[2h])) + 0.0001)
+              ) > (3.0 * 0.01)
+            )
+          for: 1h
+          labels:
+            severity: warning
+            team: platform
+            tier: slo
+            alert_type: burn-rate
+          annotations:
+            summary: "Sustained availability burn rate (3.0x) over 24 hours"
+            description: |
+              Persistent degradation consuming 10% of the error budget every 24 hours.
+              Triage during next working hours.
+            runbook_url: "https://github.com/Harshads-git/aws-keda-eks-autoscaling/blob/main/docs/slo-guide.md"
+            dashboard_url: "http://localhost:3000/d/smartscale-slo-burn-rate"
+
+        # ─── 4. Error Budget Fully Exhausted (SLO Breach) ────────────────────────
+        - alert: KedaDemoSLOErrorBudgetExhausted
+          expr: |
+            (
+              (sum(increase(keda_demo_messages_processed_total[30d])) or vector(1))
+              /
+              ((sum(increase(keda_demo_messages_processed_total[30d])) + sum(increase(keda_demo_messages_failed_total[30d]))) or vector(1))
+            ) < 0.99
+          for: 5m
+          labels:
+            severity: critical
+            team: platform
+            tier: slo
+            alert_type: budget-exhausted
+          annotations:
+            summary: "30-Day Error Budget Exhausted (Availability < 99.0%)"
+            description: |
+              The 30-day rolling message availability is below the 99.0% SLO target.
+              Policy requires a deployment freeze: prioritize stability and defect fixes.
+            runbook_url: "https://github.com/Harshads-git/aws-keda-eks-autoscaling/blob/main/docs/slo-guide.md#policy-when-budget-is-exhausted"
+
+    # ── Group 2: Latency SLO Alerts ──────────────────────────────────────────
+    - name: keda-demo.slo.latency
+      interval: 30s
+      rules:
+        # ─── 5. P99 Latency Budget Burn (1h / 5m exceeding 5.0s) ─────────────────
+        - alert: KedaDemoSLOLatencyBudgetBurnWarning
+          expr: |
+            (
+              histogram_quantile(0.99, sum(rate(keda_demo_message_processing_duration_seconds_bucket[1h])) by (le)) > 5.0
+            )
+            and
+            (
+              histogram_quantile(0.99, sum(rate(keda_demo_message_processing_duration_seconds_bucket[5m])) by (le)) > 5.0
+            )
+          for: 5m
+          labels:
+            severity: warning
+            team: platform
+            tier: slo
+            alert_type: latency-slo
+          annotations:
+            summary: "P99 message latency exceeds 5.0s SLO target"
+            description: |
+              P99 message processing duration is above the 5.0 second objective across
+              both 1-hour and 5-minute evaluation windows. Check CPU limits and SQS network latency.
+            runbook_url: "https://github.com/Harshads-git/aws-keda-eks-autoscaling/blob/main/docs/slo-guide.md#latency-slo-remediation"
+            dashboard_url: "http://localhost:3000/d/smartscale-slo-burn-rate"
