@@ -217,3 +217,61 @@ holidays, and trend changepoints — all automatically.
 **AWS SQS + KEDA is a better foundation for predictive scaling** than GCP Pub/Sub
 because SQS provides a direct `ApproximateNumberOfMessages` attribute — a clean
 training signal. Pub/Sub requires more complex metric extraction.
+
+---
+
+## 7. Model Comparison: Linear Regression vs ARIMA vs Prophet
+
+SmartScale AI ships with two forecasting models that the `ModelEvaluator` (Day 37)
+benchmarks and selects from automatically.
+
+### Side-by-Side Comparison
+
+| Attribute | Linear Regression | ARIMA(1,1,1) | Prophet (Future) |
+|---|---|---|---|
+| **Location** | `ai/predictor.py` | `ai/arima_predictor.py` | `ai/prophet_predictor.py` |
+| **Min data points** | 10–15 | 30–50 | 50–100+ |
+| **Training time** | < 1ms | 10–100ms | 1–5s |
+| **Time-series aware** | Manual features | Built-in (ARIMA structure) | Built-in (Fourier seasonality) |
+| **Handles seasonality** | ❌ No | Partial (via AR lags) | ✅ Yes (daily/weekly) |
+| **Handles trends** | ✅ Yes (linear) | ✅ Yes (differencing) | ✅ Yes (non-linear) |
+| **Confidence score** | R² + data density | 1 - (RMSE / mean) | Posterior uncertainty |
+| **Interpretability** | High (coefficients) | Medium (parameters) | Low (decomposition) |
+| **Python package** | scikit-learn | statsmodels | prophet (Facebook) |
+
+### When Each Model Wins
+
+**Linear Regression is better when:**
+- Fewer than 30 observations are available (new deployment, cold start).
+- Traffic follows a simple linear growth or decay pattern.
+- Sub-millisecond training is required (edge deployments, very frequent retraining).
+
+**ARIMA is better when:**
+- Queue depth shows clear autocorrelation (current depth predicts next depth).
+- Traffic has irregular non-linear bursts that are not purely cyclical.
+- You need statistically-grounded confidence intervals (the MA term corrects for errors).
+
+**Prophet would be better when (future):**
+- 30+ days of data are available with clear daily/weekly seasonality.
+- Workload has predictable patterns (e.g., batch processing jobs that run every morning).
+
+### Evaluation Metric: MAPE
+
+The `ModelEvaluator` (Day 37) uses Mean Absolute Percentage Error as the primary selection criterion.
+- **MAPE < 10%:** Excellent — model is production-ready.
+- **MAPE 10–20%:** Acceptable — monitor and retrain monthly.
+- **MAPE > 20%:** Poor — fall back to reactive KEDA (confidence threshold < 0.5).
+
+### Automatic Model Selection
+
+```python
+# Pseudocode: ModelEvaluator auto-selection (ai/model_evaluator.py — Day 37)
+lr_mape    = backtesting_mape(LinearRegressionPredictor, historical_data)
+arima_mape = backtesting_mape(ARIMAPredictor,            historical_data)
+
+best_model = "linear_regression" if lr_mape < arima_mape else "arima"
+model_registry.save(best_model, version=today)
+```
+
+The KEDA External Scaler uses the model selected by the registry,
+falling back to reactive (actual queue depth) if confidence < 0.5.
