@@ -157,7 +157,7 @@ jobs:
     needs: lint
     defaults:
       run:
-        working-directory: ai
+        working-directory: .  # Run from repo root (ai/ imports reference repo root)
 
     steps:
       - name: Checkout code
@@ -170,12 +170,38 @@ jobs:
           cache: pip
 
       - name: Install AI module dependencies
-        run: pip install -r requirements.txt pytest
+        run: |
+          pip install -r application/requirements.txt
+          # AI-specific dependencies
+          pip install pytest scikit-learn statsmodels
 
-      - name: Run AI predictor tests
+      - name: Run Linear Regression predictor tests (Day 25)
+        working-directory: ai
         run: python -m pytest test_predictor.py --verbose --tb=short
 
+      - name: Run ARIMA predictor tests (Day 36)
+        # Tests use mocking — statsmodels not actually called during unit tests
+        # This validates fallback behaviour, dataclass structure, and window management
+        run: python -m pytest ai/test_arima_predictor.py --verbose --tb=short
+
+      - name: Run Model Evaluator + Registry tests (Day 37)
+        # Tests use temporary directories — no filesystem cleanup needed
+        run: python -m pytest ai/test_model_evaluator.py --verbose --tb=short
+
+      - name: Run Logging tests (Day 33)
+        run: python -m pytest application/test_logging.py --verbose --tb=short
+
+      - name: Run all AI tests as a combined suite
+        # Final gate: run everything together to catch interaction issues
+        run: |
+          python -m pytest ai/ application/test_logging.py \
+            --verbose \
+            --tb=short \
+            --ignore=ai/test_predictor.py \
+            -q
+
       - name: Run predictor demo (smoke test)
+        working-directory: ai
         run: |
           python predictor.py 2>&1 | tail -5
           echo "✅ AI predictor demo ran without errors"
