@@ -1,0 +1,167 @@
+---
+# manifests/dlq-deployment.yaml — DLQ Consumer Deployment
+# =============================================================================
+# Deploys the DLQ processor (application/dlq_processor.py) as a separate
+# Kubernetes Deployment from the main keda-demo consumer.
+#
+# Why a separate Deployment (not a second container in keda-demo)?
+#   - Independent scaling: DLQ depth is typically 0. keda-demo-dlq scales to 0
+#     most of the time; the main consumer does not.
+#   - Independent resource limits: DLQ processing is slower (backoff + retries),
+#     so it needs different CPU/memory sizing.
+#   - Fault isolation: a crashing DLQ processor doesn't restart the main consumer.
+#   - Separate metrics: dlq_* Prometheus metrics on port 8081 are independent.
+#
+# The DLQ ScaledObject (dlq-scaled-object.yaml) manages replica count based on
+# the DLQ queue depth, just like the main KEDA ScaledObject watches the main queue.
+#
+# To deploy:
+#   kubectl apply -f manifests/dlq-deployment.yaml
+#   kubectl apply -f manifests/dlq-scaled-object.yaml
+# =============================================================================
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: keda-demo-dlq
+  namespace: keda-demo
+  labels:
+    app.kubernetes.io/name: keda-demo-dlq
+    app.kubernetes.io/component: dlq-consumer
+    app.kubernetes.io/part-of: smartscale-ai
+    app.kubernetes.io/managed-by: kubectl
+  annotations:
+    # DLQ processor: handles messages that failed 3+ times in main queue.
+    # Scales independently via dlq-scaled-object.yaml.
+    smartscale.ai/description: "Dead Letter Queue consumer with exponential backoff retry"
+spec:
+  # Start at 0 replicas — KEDA manages the actual count based on DLQ depth.
+  # When DLQ is empty (normal operation): 0 pods, 0 cost.
+  # When DLQ has messages: KEDA scales up to process and archive them.
+  replicas: 0
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: keda-demo-dlq
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: keda-demo-dlq
+        app.kubernetes.io/component: dlq-consumer
+      annotations:
+        # Prometheus scraping for DLQ-specific metrics (port 8081)
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8081"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: keda-demo-sa
+      terminationGracePeriodSeconds: 60  # Allow in-progress retries to complete
+
+      containers:
+        - name: dlq-consumer
+          image: keda-demo-app:latest
+          imagePullPolicy: IfNotPresent
+          command: ["python", "dlq_processor.py"]
+
+          ports:
+            - containerPort: 8081
+              name: metrics
+              protocol: TCP
+
+          env:
+            # ── Queue Configuration ────────────────────────────────────────
+            - name: DLQ_QUEUE_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: keda-demo-config
+                  key: DLQ_QUEUE_URL
+                  optional: true  # DLQ URL may not be set in local demo
+
+            - name: SQS_QUEUE_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: keda-demo-config
+                  key: SQS_QUEUE_URL
+
+            # ── Retry Configuration ────────────────────────────────────────
+            - name: DLQ_MAX_RETRIES
+              value: "3"
+
+            - name: DLQ_BASE_BACKOFF_S
+              value: "2.0"
+
+            - name: DLQ_MAX_BACKOFF_S
+              value: "30.0"
+
+            # ── AWS Configuration ──────────────────────────────────────────
+            - name: AWS_DEFAULT_REGION
+              valueFrom:
+                configMapKeyRef:
+                  name: keda-demo-config
+                  key: AWS_DEFAULT_REGION
+                  optional: true
+
+            - name: AWS_ENDPOINT_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: keda-demo-config
+                  key: AWS_ENDPOINT_URL
+                  optional: true
+
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: local-aws-secret
+                  key: AWS_ACCESS_KEY_ID
+                  optional: true
+
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: local-aws-secret
+                  key: AWS_SECRET_ACCESS_KEY
+                  optional: true
+
+            # ── Pod Metadata (Downward API for structured logging) ─────────
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+
+            # ── Processing ────────────────────────────────────────────────
+            - name: PROCESSING_DELAY_SECONDS
+              value: "0.5"  # DLQ processing is slower (more careful)
+            - name: DLQ_METRICS_PORT
+              value: "8081"
+
+          resources:
+            requests:
+              cpu: 25m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 256Mi
+
+          livenessProbe:
+            # DLQ processor is healthy as long as the Python process is running
+            exec:
+              command: ["python", "-c", "import sys; sys.exit(0)"]
+            initialDelaySeconds: 10
+            periodSeconds: 30
+            failureThreshold: 3
+
+          readinessProbe:
+            # Ready once metrics endpoint is available
+            tcpSocket:
+              port: 8081
+            initialDelaySeconds: 5
+            periodSeconds: 10
+
+      restartPolicy: Always

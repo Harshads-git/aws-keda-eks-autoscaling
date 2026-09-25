@@ -1,0 +1,96 @@
+---
+# manifests/dlq-scaled-object.yaml — KEDA ScaledObject for DLQ Consumer
+# =============================================================================
+# Configures KEDA to scale the keda-demo-dlq Deployment based on the
+# ApproximateNumberOfMessages in the Dead Letter Queue.
+#
+# Key differences from the main ScaledObject (manifests/scaled-object.yaml):
+#   - scaleTargetRef: keda-demo-dlq (not keda-demo)
+#   - minReplicaCount: 0 (DLQ is usually empty, we want 0 cost)
+#   - maxReplicaCount: 2 (DLQ processing is slow, limit parallelism)
+#   - targetMetricValue: 3 (fewer messages per pod — retry logic is expensive)
+#   - cooldownPeriod: 60 (wait longer before scaling down after processing)
+#   - queueURL: DLQ_QUEUE_URL (different queue from main consumer)
+#
+# How it works:
+#   KEDA polls DLQ every pollingInterval seconds.
+#   desiredReplicas = ceil(dlq_depth / targetMetricValue)
+#   DLQ depth = 0  → 0 replicas (scale to zero, no cost)
+#   DLQ depth = 3  → ceil(3/3) = 1 replica
+#   DLQ depth = 6  → ceil(6/3) = 2 replicas (capped at maxReplicaCount=2)
+#
+# To apply:
+#   kubectl apply -f manifests/dlq-scaled-object.yaml
+# =============================================================================
+
+---
+# TriggerAuthentication for DLQ queue (re-uses same secret as main consumer)
+apiVersion: keda.sh/v1alpha1
+kind: TriggerAuthentication
+metadata:
+  name: keda-dlq-auth
+  namespace: keda-demo
+spec:
+  secretTargetRef:
+    - parameter: awsAccessKeyID
+      name: local-aws-secret
+      key: AWS_ACCESS_KEY_ID
+    - parameter: awsSecretAccessKey
+      name: local-aws-secret
+      key: AWS_SECRET_ACCESS_KEY
+
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: keda-demo-dlq
+  namespace: keda-demo
+  labels:
+    app.kubernetes.io/name: keda-demo-dlq
+    app.kubernetes.io/component: keda-scaledobject
+  annotations:
+    # DLQ scaler: 3 messages per pod (slow backoff + retry processing)
+    # Main scaler: 5 messages per pod (faster normal processing)
+    smartscale.ai/description: "KEDA ScaledObject for Dead Letter Queue consumer"
+spec:
+  scaleTargetRef:
+    name: keda-demo-dlq
+
+  # Scale to zero when DLQ is empty (cost optimization)
+  minReplicaCount: 0
+  maxReplicaCount: 2
+
+  # Check DLQ depth every 15 seconds
+  pollingInterval: 15
+
+  # Wait 60 seconds of inactivity before scaling to zero
+  # Longer than main consumer (30s) because DLQ retry backoff can make
+  # pods appear idle between retries even when work remains
+  cooldownPeriod: 60
+
+  # Prevent rapid scaling oscillation: wait 120s between scale-up events
+  # DLQ messages are slow to process (backoff); avoid premature scale-up
+  advanced:
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleUp:
+          stabilizationWindowSeconds: 120
+          policies:
+            - type: Pods
+              value: 1          # Add at most 1 pod per scale-up event
+              periodSeconds: 60
+        scaleDown:
+          stabilizationWindowSeconds: 120
+
+  triggers:
+    - type: aws-sqs-queue
+      authenticationRef:
+        name: keda-dlq-auth
+      metadata:
+        # DLQ queue — set via keda-demo-config ConfigMap in production
+        # For local demo: same queue with "-dlq" suffix convention
+        queueURL: "http://local-sqs.keda-demo.svc.cluster.local:9324/000000000000/keda-demo-queue-dlq"
+        queueLength: "3"           # Scale: 1 pod per 3 DLQ messages
+        awsRegion: "us-east-1"
+        awsEndpoint: "http://local-sqs.keda-demo.svc.cluster.local:9324"
+        scaleOnInFlight: "false"   # Only count visible messages (not in-flight)
