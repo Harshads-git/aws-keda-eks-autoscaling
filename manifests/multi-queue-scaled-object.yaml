@@ -1,0 +1,110 @@
+---
+# manifests/multi-queue-scaled-object.yaml — Multi-Queue KEDA ScaledObject
+# =============================================================================
+# Configures a SINGLE ScaledObject with MULTIPLE SQS triggers.
+# KEDA evaluates all triggers and uses the MAXIMUM desired replica count
+# across all triggers (OR logic, not AND).
+#
+# Use case: SmartScale AI receives two types of traffic:
+#   1. keda-demo-queue-priority  — High-priority messages (payment events,
+#                                  alerts). Must be processed with low latency.
+#                                  Target: 2 messages/pod (scale aggressively)
+#   2. keda-demo-queue-batch    — Low-priority bulk batch jobs (reports,
+#                                  analytics). Can wait. Target: 10 messages/pod
+#
+# How KEDA chooses replica count with multiple triggers:
+#   priority_queue_depth = 20 → desiredReplicas = ceil(20/2)  = 10
+#   batch_queue_depth    = 30 → desiredReplicas = ceil(30/10) = 3
+#   KEDA selects MAX(10, 3) = 10 replicas
+#
+# This means: a burst of priority messages immediately drives up replicas
+# even if the batch queue is calm. Batch messages then get processed by the
+# surplus capacity (pods handling both queue types).
+#
+# Why not two separate Deployments?
+#   Two deployments means two sets of pods, doubling resource consumption.
+#   One deployment with a multi-queue consumer handles BOTH queues with
+#   one set of pods, using priority routing (priority queue checked first).
+#
+# To apply:
+#   kubectl apply -f manifests/multi-queue-scaled-object.yaml
+# =============================================================================
+
+---
+# TriggerAuthentication shared by both SQS triggers
+apiVersion: keda.sh/v1alpha1
+kind: TriggerAuthentication
+metadata:
+  name: keda-multi-auth
+  namespace: keda-demo
+spec:
+  secretTargetRef:
+    - parameter: awsAccessKeyID
+      name: local-aws-secret
+      key: AWS_ACCESS_KEY_ID
+    - parameter: awsSecretAccessKey
+      name: local-aws-secret
+      key: AWS_SECRET_ACCESS_KEY
+
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: keda-demo-multi-queue
+  namespace: keda-demo
+  labels:
+    app.kubernetes.io/name: keda-demo-multi-queue
+    app.kubernetes.io/component: keda-scaledobject
+    app.kubernetes.io/part-of: smartscale-ai
+  annotations:
+    smartscale.ai/description: "Multi-queue ScaledObject: priority + batch SQS triggers"
+spec:
+  scaleTargetRef:
+    name: keda-demo-multi-queue   # Targets the multi-queue consumer Deployment
+
+  minReplicaCount: 0
+  maxReplicaCount: 10
+
+  pollingInterval: 10   # Check both queues every 10 seconds
+  cooldownPeriod: 30
+
+  advanced:
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleUp:
+          stabilizationWindowSeconds: 0   # Scale up immediately (priority traffic)
+          policies:
+            - type: Percent
+              value: 100        # Allow doubling pod count per period
+              periodSeconds: 15
+        scaleDown:
+          stabilizationWindowSeconds: 60  # Wait 60s before scaling down
+
+  triggers:
+    # ── Trigger 1: Priority Queue ──────────────────────────────────────────────
+    # Aggressive scaling: 2 messages per pod (low latency requirement)
+    # A burst of 20 messages → ceil(20/2) = 10 pods immediately
+    - type: aws-sqs-queue
+      name: priority-queue-trigger    # Named triggers appear in KEDA metrics
+      authenticationRef:
+        name: keda-multi-auth
+      metadata:
+        queueURL: "http://local-sqs.keda-demo.svc.cluster.local:9324/000000000000/keda-demo-queue-priority"
+        queueLength: "2"              # 2 messages per pod (aggressive)
+        awsRegion: "us-east-1"
+        awsEndpoint: "http://local-sqs.keda-demo.svc.cluster.local:9324"
+        scaleOnInFlight: "true"       # Count in-flight for priority (no lag)
+
+    # ── Trigger 2: Batch Queue ─────────────────────────────────────────────────
+    # Conservative scaling: 10 messages per pod (throughput, not latency)
+    # A batch of 100 messages → ceil(100/10) = 10 pods
+    - type: aws-sqs-queue
+      name: batch-queue-trigger
+      authenticationRef:
+        name: keda-multi-auth
+      metadata:
+        queueURL: "http://local-sqs.keda-demo.svc.cluster.local:9324/000000000000/keda-demo-queue-batch"
+        queueLength: "10"             # 10 messages per pod (conservative)
+        awsRegion: "us-east-1"
+        awsEndpoint: "http://local-sqs.keda-demo.svc.cluster.local:9324"
+        scaleOnInFlight: "false"      # Only count visible (backlog-based scaling)
