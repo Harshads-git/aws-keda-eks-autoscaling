@@ -1,0 +1,157 @@
+---
+# manifests/prediction-api-deployment.yaml — Prediction API Deployment + Service
+# =============================================================================
+# Deploys the FastAPI prediction server (application/prediction_api.py).
+#
+# Integration with KEDA External Scaler:
+#   The KEDA External Scaler (if configured) can query:
+#     GET http://prediction-api.keda-demo.svc.cluster.local:8090/predict?queue_depth=<N>
+#   and use the returned `recommended_replicas` as the target metric value.
+#
+#   This closes the feedback loop for predictive scaling:
+#     SQS → KEDA polls depth → sends to prediction-api → AI returns replicas
+#     → KEDA sets HPA target → Kubernetes adjusts pod count
+#
+# The prediction API itself does NOT scale to zero (it must be always-on
+# to serve KEDA's External Scaler queries instantly). It runs as 1 replica
+# and is lightweight (<100m CPU, <128Mi memory).
+#
+# To deploy:
+#   kubectl apply -f manifests/prediction-api-deployment.yaml
+#
+# To test:
+#   kubectl port-forward -n keda-demo svc/prediction-api 8090:8090 &
+#   curl "http://localhost:8090/predict?queue_depth=15"
+#   curl "http://localhost:8090/model/info"
+# =============================================================================
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prediction-api
+  namespace: keda-demo
+  labels:
+    app.kubernetes.io/name: prediction-api
+    app.kubernetes.io/component: ai-server
+    app.kubernetes.io/part-of: smartscale-ai
+    app.kubernetes.io/managed-by: kubectl
+  annotations:
+    smartscale.ai/description: "FastAPI server exposing AI scaling predictions for KEDA External Scaler"
+spec:
+  replicas: 1   # Always on — KEDA External Scaler needs this to be available
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: prediction-api
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: prediction-api
+        app.kubernetes.io/component: ai-server
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8090"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: keda-demo-sa
+
+      containers:
+        - name: prediction-api
+          image: keda-demo-app:latest
+          imagePullPolicy: IfNotPresent
+          command: ["python", "prediction_api.py"]
+
+          ports:
+            - containerPort: 8090
+              name: http
+              protocol: TCP
+
+          env:
+            # ── API Configuration ──────────────────────────────────────────
+            - name: API_PORT
+              value: "8090"
+            - name: API_HOST
+              value: "0.0.0.0"
+
+            # ── Model Configuration ────────────────────────────────────────
+            # Switch between 'linear_regression' (default) and 'arima'
+            - name: MODEL_TYPE
+              value: "linear_regression"
+            - name: HORIZON_MINUTES
+              value: "3"
+            - name: TARGET_QUEUE_LENGTH
+              value: "5"
+            - name: MAX_REPLICAS
+              value: "5"
+            - name: CONFIDENCE_THRESHOLD
+              value: "0.5"
+
+            # ── AWS Configuration (for real SQS depth in future) ───────────
+            - name: AWS_DEFAULT_REGION
+              valueFrom:
+                configMapKeyRef:
+                  name: keda-demo-config
+                  key: AWS_DEFAULT_REGION
+                  optional: true
+
+            - name: AWS_ENDPOINT_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: keda-demo-config
+                  key: AWS_ENDPOINT_URL
+                  optional: true
+
+            # ── Pod Metadata ───────────────────────────────────────────────
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 200m
+              memory: 256Mi
+
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8090
+            initialDelaySeconds: 10
+            periodSeconds: 30
+            failureThreshold: 3
+
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 8090
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 3
+
+      restartPolicy: Always
+
+---
+# ── Service: routes traffic to the prediction API pod ─────────────────────────
+apiVersion: v1
+kind: Service
+metadata:
+  name: prediction-api
+  namespace: keda-demo
+  labels:
+    app.kubernetes.io/name: prediction-api
+    app.kubernetes.io/component: ai-server
+spec:
+  selector:
+    app.kubernetes.io/name: prediction-api
+  type: ClusterIP
+  ports:
+    - name: http
+      port: 8090
+      targetPort: 8090
+      protocol: TCP
