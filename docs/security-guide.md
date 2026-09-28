@@ -1,258 +1,222 @@
-# Security Guide: Defense-in-Depth for KEDA on EKS
+# Security Guide — SmartScale AI
 
-This guide explains the complete security model: how RBAC, Pod Security Standards,
-IRSA, NetworkPolicy, and Secrets Management work together as independent layers,
-each limiting blast radius if another layer is compromised.
-
----
-
-## 1. Security Architecture Overview
-
-```
-Request path: Consumer pod → SQS API
-  Layer 1: IRSA (AWS IAM)        ← which AWS actions are allowed
-  Layer 2: NetworkPolicy         ← which IPs/ports the pod can reach
-  Layer 3: Pod Security Context  ← what the container process can do on the node
-  Layer 4: K8s RBAC              ← what the ServiceAccount can do to the K8s API
-  Layer 5: ResourceQuota         ← how much cluster resources can be consumed
-```
-
-Each layer is independent. Bypassing one does not bypass others.
+Vulnerability management, CVE triage process, and security scanning integration
+for the SmartScale AI AWS KEDA EKS autoscaling project.
 
 ---
 
-## 2. IRSA — Least-Privilege AWS Permissions
+## 1. Security Scanning Overview
 
-Defined in [`terraform/modules/irsa/main.tf`](../terraform/modules/irsa/main.tf).
+SmartScale AI uses **Trivy** (Aqua Security) for continuous vulnerability scanning:
 
-### What the consumer IAM role is allowed to do
+| Scan Target | Tool | Trigger | Blocks PR? |
+|---|---|---|---|
+| Docker image (OS + pip) | Trivy image | Every push, weekly | YES — HIGH/CRITICAL |
+| Python requirements.txt | Trivy fs | Every push | YES — HIGH/CRITICAL |
+| Dockerfile misconfigs | Trivy fs --misconfig | Every push | YES — HIGH/CRITICAL |
+| Secrets in code | Trivy fs --secret | Every push | YES — HIGH/CRITICAL |
+| K8s manifest misconfigs | Trivy config | Every push | NO — Informational |
+| Terraform IaC | Trivy config (future) | Future | — |
 
-```json
-{
-  "Effect": "Allow",
-  "Action": [
-    "sqs:ReceiveMessage",
-    "sqs:DeleteMessage",
-    "sqs:GetQueueAttributes"
-  ],
-  "Resource": "arn:aws:sqs:us-east-1:183264980:keda-demo-queue"
-}
-```
-
-### What it is NOT allowed to do
-
-```
-❌ sqs:SendMessage          — cannot write to the queue (only reads)
-❌ sqs:DeleteQueue          — cannot delete the queue itself
-❌ sqs:*                    — no wildcard permissions
-❌ s3:*                     — no S3 access
-❌ ec2:*                    — no EC2 access
-❌ iam:*                    — cannot create/modify IAM roles
-```
-
-### How IRSA works (trust chain)
-
-```
-1. EKS cluster has an OIDC provider URL (set up by Terraform)
-2. Consumer pod gets a projected ServiceAccount token (auto-mounted)
-3. boto3 detects AWS_ROLE_ARN + AWS_WEB_IDENTITY_TOKEN_FILE env vars
-4. boto3 calls sts:AssumeRoleWithWebIdentity with the SA token
-5. AWS STS verifies token against OIDC provider
-6. STS returns temporary credentials (valid ~1 hour, auto-refreshed)
-7. boto3 uses temp credentials for all SQS API calls
-```
-
-No static `AWS_ACCESS_KEY_ID` or `AWS_SECRET_ACCESS_KEY` anywhere in the cluster.
+**GitHub Security tab:** All scan results are uploaded as SARIF reports, viewable at:
+`https://github.com/Harshads-git/aws-keda-eks-autoscaling/security/code-scanning`
 
 ---
 
-## 3. Kubernetes RBAC
+## 2. Running Scans Locally
 
-Defined in [`manifests/rbac.yaml`](../manifests/rbac.yaml).
-
-### What the consumer ServiceAccount CAN do
-
-| Resource | Actions | Scope |
-|---|---|---|
-| `configmaps` | get, watch, list | Only `keda-demo-config` (by name) |
-| `pods` | get | Own pod only (via token identity) |
-
-### What the consumer ServiceAccount CANNOT do
+Always scan locally **before pushing** to catch CVEs early:
 
 ```bash
-# Test with kubectl auth can-i:
-kubectl auth can-i get secrets \
-  --as=system:serviceaccount:keda-demo:keda-demo -n keda-demo
-# → no
+# Full scan (image + filesystem + K8s configs)
+./scripts/trivy-scan.sh
 
-kubectl auth can-i create pods \
-  --as=system:serviceaccount:keda-demo:keda-demo -n keda-demo
-# → no
+# Image scan only (quickest check after Dockerfile changes)
+./scripts/trivy-scan.sh image
 
-kubectl auth can-i get pods -n kube-system \
-  --as=system:serviceaccount:keda-demo:keda-demo
-# → no (RBAC is namespace-scoped, can't cross namespace boundary)
+# Filesystem only (after requirements.txt changes)
+./scripts/trivy-scan.sh fs
+
+# All severities (for full review, not just blocking ones)
+./scripts/trivy-scan.sh --all-sev
 ```
 
-### Why RBAC matters even with IRSA
-
-An attacker who compromises a consumer pod gets:
-- The pod's ServiceAccount token (mounted at `/var/run/secrets/kubernetes.io/...`)
-- This token has ONLY the permissions defined in the Role
-
-With least-privilege RBAC:
-```
-Compromised pod → SA token → K8s API
-→ Can read: keda-demo-config (not useful to attacker)
-→ Cannot: read secrets, create pods, access other namespaces
-→ Blast radius: minimal
-```
-
-Without RBAC (default ServiceAccount):
-```
-Default SA has no permissions in a hardened cluster (also safe)
-BUT: cluster-admin bindings on default SA = cluster takeover risk
-```
-
----
-
-## 4. Pod Security Standards (PSS)
-
-Enforced via namespace labels in [`manifests/namespace.yaml`](../manifests/namespace.yaml).
-
-### Three PSS levels
-
-| Level | Description | What it blocks |
-|---|---|---|
-| `privileged` | No restrictions | Nothing |
-| `baseline` | Minimal sanity | Host namespaces, privileged containers |
-| `restricted` | Hardened | Everything baseline + non-root requirement, seccomp |
-
-This project uses **`restricted`** on the `keda-demo` namespace.
-
-### What `restricted` enforces on every pod
-
-```yaml
-# These fields MUST be set correctly or pod is REJECTED:
-securityContext:
-  runAsNonRoot: true            # Cannot run as root (UID 0)
-  runAsUser: ≥ 1               # Must have explicit non-root UID
-  seccompProfile:
-    type: RuntimeDefault        # Must have seccomp profile
-
-containers[].securityContext:
-  allowPrivilegeEscalation: false  # Cannot sudo/setuid
-  capabilities:
-    drop: [ALL]                    # No Linux capabilities
-```
-
-### Verify PSS is enforcing
+### One-liner scan without the script
 
 ```bash
-# Attempt to run a privileged pod in keda-demo namespace:
-kubectl run bad-pod \
-  --image=nginx \
-  --overrides='{"spec":{"containers":[{"name":"bad-pod","image":"nginx","securityContext":{"privileged":true}}]}}' \
-  -n keda-demo
+# Scan Docker image directly
+trivy image --severity HIGH,CRITICAL --ignore-unfixed keda-demo-app:latest
 
-# Expected output:
-# Error from server (Forbidden):
-#   pods "bad-pod" is forbidden: violates PodSecurity "restricted:latest"
+# Scan Python requirements
+trivy fs --severity HIGH,CRITICAL --scanners vuln application/requirements.txt
+
+# Check for secrets in entire repo
+trivy fs --scanners secret .
 ```
 
 ---
 
-## 5. Pod Security Context
+## 3. CVE Triage Process
 
-Defined in [`manifests/deployment.yaml`](../manifests/deployment.yaml).
+When Trivy reports a vulnerability, follow this decision tree:
+
+```
+CVE Found
+    │
+    Is it in a package we directly import?
+    │
+    YES → Check if a fixed version exists
+    │       Fixed version available → UPDATE requirements.txt
+    │       No fix yet (ignore-unfixed) → SKIP (CI already ignores unfixed)
+    │
+    NO  → Transitive dependency
+            Can we pin the fixed transitive? → ADD to requirements.txt
+            No fix in dep tree → ACCEPT + document in .trivyignore
+
+Severity?
+    CRITICAL → Fix immediately (block release)
+    HIGH     → Fix before next sprint
+    MEDIUM   → Fix within 30 days
+    LOW      → Fix opportunistically (next requirements.txt update)
+```
+
+### Accepting a known false-positive
+
+Create `.trivyignore` at the repo root:
+
+```
+# .trivyignore — Known acceptable false positives
+# Format: CVE-ID [space] # Justification
+
+# Example: CVE-2023-12345 is in the 'dev' extra of urllib3 which we don't use.
+# Tracking: https://github.com/Harshads-git/aws-keda-eks-autoscaling/issues/42
+CVE-2023-12345
+
+# Example: Pillow CVE only affects image processing; we don't process images.
+CVE-2023-67890
+```
+
+---
+
+## 4. Fixing Vulnerable Python Packages
+
+### Step 1: Identify the CVE
+
+```bash
+# Get JSON output with full CVE details
+trivy fs --format json --scanners vuln application/requirements.txt \
+  | jq '.Results[].Vulnerabilities[] | {pkg: .PkgName, id: .VulnerabilityID, severity: .Severity, fix: .FixedVersion}'
+```
+
+### Step 2: Update requirements.txt
+
+```
+# Before (vulnerable):
+boto3==1.26.0
+
+# After (patched):
+boto3==1.34.0   # Fixed CVE-2023-XXXXX (SSRF in presigned URL handling)
+```
+
+### Step 3: Verify fix with pip-audit
+
+```bash
+pip install pip-audit
+pip-audit -r application/requirements.txt
+```
+
+### Step 4: Re-run Trivy
+
+```bash
+./scripts/trivy-scan.sh fs
+```
+
+---
+
+## 5. Kubernetes Manifest Security Best Practices
+
+Trivy's `config` scan checks for these Kubernetes security misconfigurations:
+
+| Check | Rule | Fix |
+|---|---|---|
+| Running as root | `KSV020` | Add `runAsNonRoot: true` to `securityContext` |
+| Writable root filesystem | `KSV014` | Add `readOnlyRootFilesystem: true` |
+| Missing securityContext | `KSV030` | Add `securityContext: {}` block |
+| Privileged container | `KSV017` | Remove `privileged: true` |
+| Missing resource limits | `KSV011` | Add `resources.limits.cpu/memory` |
+| Allow privilege escalation | `KSV001` | Add `allowPrivilegeEscalation: false` |
+
+### Recommended securityContext for production
 
 ```yaml
+# Add to each container spec in production (not local demo)
 securityContext:
   runAsNonRoot: true
-  runAsUser: 1001           # Non-root UID (app.py runs as this user)
-  runAsGroup: 1001
-  fsGroup: 1001
-  seccompProfile:
-    type: RuntimeDefault    # Kernel syscall filter (reduces attack surface)
-
-containers[].securityContext:
-  allowPrivilegeEscalation: false  # Prevents setuid/setgid exploits
-  readOnlyRootFilesystem: false    # app.py writes /tmp/healthy
+  runAsUser: 1000
+  readOnlyRootFilesystem: true
+  allowPrivilegeEscalation: false
   capabilities:
-    drop: [ALL]             # No NET_ADMIN, no SYS_ADMIN, no CAP_NET_RAW, etc.
+    drop:
+      - ALL
 ```
 
-### What dropping ALL capabilities prevents
-
-```
-CAP_NET_ADMIN:  Cannot modify network interfaces, firewall rules
-CAP_SYS_ADMIN:  Cannot mount filesystems, change namespaces
-CAP_NET_RAW:    Cannot craft raw packets (ARP spoofing, ICMP floods)
-CAP_SETUID:     Cannot change process UID (no privilege escalation)
-```
-
-A compromised process in the container can't do any of the above even if
-it gains code execution — the kernel enforces these limits.
+> **Note:** The local demo manifests (keda-demo-app) intentionally omit some of
+> these settings for simplicity. The Trivy config scan is set to `exit-code: 0`
+> (informational only) for this reason.
 
 ---
 
-## 6. Secrets Management Decision Tree
+## 6. Secret Detection
 
-```
-What type of value is it?
+Trivy's `--scanners secret` check prevents accidentally committed credentials.
 
-AWS credential (access key, secret key)
-  └─ Use IRSA → no static credentials anywhere ✓
+**What it detects:**
+- AWS Access Keys (`AKIA...`)
+- GitHub Personal Access Tokens (`ghp_...`)
+- Private RSA keys
+- Slack webhook URLs
+- Generic high-entropy strings in `.env` files
 
-Non-sensitive configuration (queue URL, region, log level)
-  └─ Use ConfigMap → easy to read, no encryption overhead ✓
-
-Sensitive value (password, API key, webhook secret, TLS cert)
-  ├─ Small team, simple setup
-  │   └─ Use K8s Secret (base64 encoded, encrypted at rest if KMS enabled)
-  └─ Audit trail required / rotation needed / cross-service sharing
-      └─ Use AWS Secrets Manager + Secrets Store CSI Driver
-         └─ See manifests/secrets-manager-stub.yaml ✓
-
-K8s control plane bootstrap secret (e.g. CA cert)
-  └─ Use K8s Secret (managed by cluster) ✓
-```
-
-### Enable KMS encryption for Kubernetes Secrets
-
-```hcl
-# In terraform/modules/eks/main.tf:
-resource "aws_eks_cluster" "main" {
-  encryption_config {
-    resources = ["secrets"]  # Encrypt all K8s Secrets with KMS
-    provider {
-      key_arn = aws_kms_key.eks.arn
-    }
-  }
-}
-```
-
-Without this: K8s Secrets are base64 encoded but NOT encrypted in etcd.
+**If a secret is found:**
+1. **Revoke the secret immediately** (AWS Console > IAM > Delete access key)
+2. Remove from codebase with `git filter-repo` (not just `git rm`)
+3. Rotate all potentially-exposed secrets
+4. Add pattern to `.trivyignore` only after confirming it is a test credential
 
 ---
 
-## 7. Security Checklist
+## 7. Security Scanning in the CI Pipeline
+
+The `security-scan.yml` workflow runs on every push to `main` and every PR:
 
 ```
-☑ IRSA: no static AWS credentials, scoped to specific SQS queue
-☑ RBAC: consumer SA can only read its own ConfigMap + own Pod
-☑ Pod Security Standards: 'restricted' enforced on namespace
-☑ runAsNonRoot: container runs as UID 1001
-☑ seccompProfile: RuntimeDefault (kernel syscall filter)
-☑ capabilities: drop ALL (no Linux capabilities)
-☑ NetworkPolicy: deny all ingress, allow only DNS + HTTPS egress
-☑ ResourceQuota: caps namespace CPU/memory/pod count
-☑ PodDisruptionBudget: protects against voluntary disruptions
-
-Recommended additions:
-☐ KMS encryption for K8s Secrets at rest (terraform/modules/eks/main.tf)
-☐ AWS Secrets Manager for any actual passwords/API keys (secrets-manager-stub.yaml)
-☐ Enable AWS CloudTrail for IAM audit log
-☐ Enable EKS audit logs → CloudWatch Logs for K8s API audit trail
-☐ AWS GuardDuty for runtime threat detection (watches EKS API + EC2)
+Push/PR → security-scan.yml
+              │
+              ├── trivy-image-scan (Job 1)
+              │     Build image → Scan OS+pip → SARIF upload
+              │     EXIT 1 on HIGH/CRITICAL → PR blocked
+              │
+              ├── trivy-filesystem-scan (Job 2)
+              │     Scan requirements.txt + Dockerfile + secrets → SARIF upload
+              │     EXIT 1 on HIGH/CRITICAL → PR blocked
+              │
+              └── trivy-config-scan (Job 3)
+                    Scan manifests/ for K8s misconfigs → SARIF upload
+                    EXIT 0 always (informational)
 ```
+
+**Weekly schedule:** Runs every Monday 06:00 UTC to catch newly published CVEs
+even when no code changes have been made.
+
+---
+
+## 8. Security Metrics to Track
+
+Monitor these in the GitHub Security tab over time:
+
+| Metric | Target | Action if exceeded |
+|---|---|---|
+| Open CRITICAL CVEs | 0 | Fix immediately, block release |
+| Open HIGH CVEs | Less than 3 | Fix within current sprint |
+| Mean time to fix HIGH | Less than 7 days | Review triage process |
+| False positives in `.trivyignore` | Less than 10 | Audit quarterly |
