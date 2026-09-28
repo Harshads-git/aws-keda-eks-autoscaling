@@ -1,0 +1,196 @@
+# =============================================================================
+# .github/workflows/security-scan.yml — Trivy Security Scanning
+# =============================================================================
+# Runs Aqua Security Trivy to scan for vulnerabilities in:
+#   1. The Docker image (OS packages + Python pip packages inside the image)
+#   2. The repository filesystem (Python requirements.txt, Dockerfile misconfig)
+#   3. Kubernetes manifests (IaC misconfiguration check)
+#
+# Why Trivy (not Snyk / Grype / Anchore)?
+#   - Free and open-source (no token/subscription required for basic use)
+#   - Single binary, extremely fast (< 60s for a typical image scan)
+#   - Covers OS packages, language packages, IaC (K8s, Terraform, Helm)
+#   - GitHub SARIF output integrates with GitHub Security tab
+#   - Official action: aquasecurity/trivy-action
+#
+# Two scan modes:
+#   HIGH/CRITICAL only (fail-fast): blocks the PR if any HIGH or CRITICAL CVE
+#     found. Medium/Low are logged but do not fail the build.
+#   Full report (informational): all severities, uploaded to GitHub Security tab
+#     as a SARIF report for browsing and tracking.
+#
+# Jobs:
+#   trivy-image-scan       → Scan Docker image (built in CI, not pushed)
+#   trivy-filesystem-scan  → Scan repo files (requirements.txt, Dockerfile)
+#   trivy-config-scan      → Scan K8s manifests for misconfigurations
+# =============================================================================
+
+name: Security — Trivy Vulnerability Scan
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "application/**"
+      - "manifests/**"
+      - "terraform/**"
+      - "Dockerfile"
+      - ".github/workflows/security-scan.yml"
+
+  pull_request:
+    branches: [main]
+    paths:
+      - "application/**"
+      - "manifests/**"
+      - "Dockerfile"
+
+  # Run weekly to catch newly published CVEs even without code changes
+  schedule:
+    - cron: "0 6 * * 1"   # Every Monday at 06:00 UTC
+
+  workflow_dispatch:
+
+concurrency:
+  group: security-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ── Job 1: Docker Image Scan ─────────────────────────────────────────────────
+  trivy-image-scan:
+    name: Trivy — Docker Image
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Build Docker image for scanning
+        # Build the image locally (not pushed to a registry)
+        # Tag as keda-demo-app:scan for Trivy to target
+        run: |
+          docker build -t keda-demo-app:scan ./application
+          echo "✅ Image built for scanning"
+
+      - name: Run Trivy — HIGH/CRITICAL (fail on findings)
+        # This step fails the workflow if any HIGH or CRITICAL vulnerability
+        # is found in OS packages or Python pip packages inside the image.
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: "keda-demo-app:scan"
+          format: "table"
+          severity: "HIGH,CRITICAL"
+          exit-code: "1"              # Non-zero exit = workflow fails
+          ignore-unfixed: true        # Skip CVEs with no fix yet (no actionable)
+          vuln-type: "os,library"     # Check both OS packages AND pip packages
+
+      - name: Run Trivy — Full report (SARIF for GitHub Security tab)
+        # Always runs (even if step above fails) to upload the full report.
+        # Informational only — does not fail the build.
+        if: always()
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: "keda-demo-app:scan"
+          format: "sarif"
+          output: "trivy-image-results.sarif"
+          severity: "LOW,MEDIUM,HIGH,CRITICAL"
+          ignore-unfixed: false
+          vuln-type: "os,library"
+
+      - name: Upload image scan SARIF to GitHub Security tab
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: "trivy-image-results.sarif"
+          category: "trivy-image"
+
+      - name: Upload raw SARIF as artifact (for download)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-image-sarif
+          path: trivy-image-results.sarif
+          retention-days: 30
+
+  # ── Job 2: Filesystem / Requirements Scan ────────────────────────────────────
+  trivy-filesystem-scan:
+    name: Trivy — Filesystem (requirements.txt + Dockerfile)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run Trivy — filesystem HIGH/CRITICAL (fail on findings)
+        # Scans requirements.txt for known vulnerable Python package versions.
+        # Also checks Dockerfile for security misconfigurations (e.g., running as root).
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: "fs"
+          scan-ref: "."            # Scan entire repo
+          format: "table"
+          severity: "HIGH,CRITICAL"
+          exit-code: "1"
+          ignore-unfixed: true
+          scanners: "vuln,misconfig,secret"   # Scan vulns + IaC misconfig + secrets
+
+      - name: Run Trivy — Full filesystem SARIF report
+        if: always()
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: "fs"
+          scan-ref: "."
+          format: "sarif"
+          output: "trivy-fs-results.sarif"
+          severity: "LOW,MEDIUM,HIGH,CRITICAL"
+          scanners: "vuln,misconfig,secret"
+
+      - name: Upload filesystem SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: "trivy-fs-results.sarif"
+          category: "trivy-filesystem"
+
+  # ── Job 3: Kubernetes Manifest Misconfiguration ───────────────────────────────
+  trivy-config-scan:
+    name: Trivy — K8s Manifest Misconfiguration
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run Trivy — K8s manifest config scan
+        # Checks manifests/ for Kubernetes security best practice violations:
+        #   - Containers running as root
+        #   - Missing resource limits
+        #   - Privileged containers
+        #   - Missing readinessProbe / livenessProbe
+        #   - Writable root filesystem
+        #   - Missing securityContext
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: "config"
+          scan-ref: "manifests/"
+          format: "table"
+          severity: "HIGH,CRITICAL"
+          exit-code: "0"    # Informational only: K8s manifests often have acceptable findings
+          scanners: "misconfig"
+
+      - name: Run Trivy — Full K8s config SARIF report
+        if: always()
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: "config"
+          scan-ref: "manifests/"
+          format: "sarif"
+          output: "trivy-config-results.sarif"
+          severity: "LOW,MEDIUM,HIGH,CRITICAL"
+          scanners: "misconfig"
+
+      - name: Upload K8s config SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: "trivy-config-results.sarif"
+          category: "trivy-k8s-config"
