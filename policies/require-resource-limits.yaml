@@ -1,0 +1,145 @@
+---
+# policies/require-resource-limits.yaml
+# =============================================================================
+# OPA Gatekeeper Policy: Require Resource Limits on All Containers
+# =============================================================================
+#
+# What this policy does:
+#   Enforces that every container in every Pod defines BOTH:
+#     resources.limits.cpu    (e.g. "200m")
+#     resources.limits.memory (e.g. "256Mi")
+#
+# Why resource limits matter for KEDA autoscaling:
+#   Without resource limits, a runaway container can consume all node CPU/memory,
+#   causing OTHER pods to be evicted. In a KEDA-scaled cluster this creates a
+#   cascade: evictions trigger KEDA to scale UP more pods, which consume more
+#   resources, which evict more pods. The cluster enters a death spiral.
+#
+#   With limits:
+#     - Kubernetes knows the "worst case" footprint of each pod
+#     - Cluster Autoscaler can make accurate bin-packing decisions
+#     - KEDA pod startup is predictable (no resource starvation at scale)
+#
+# How OPA Gatekeeper works:
+#   1. ConstraintTemplate defines the policy LOGIC (Rego language)
+#   2. Constraint instantiates the template with PARAMETERS (which namespaces,
+#      which workloads are excluded)
+#   3. Gatekeeper's admission webhook intercepts every CREATE/UPDATE of a Pod
+#      and evaluates the Rego against the Pod spec
+#   4. If the Rego returns a violation: Gatekeeper REJECTS the pod (returns 403)
+#
+# Enforcement modes:
+#   enforcementAction: deny   → Hard block (use in production)
+#   enforcementAction: warn   → Allow but log warning (use during rollout)
+#   enforcementAction: dryrun → Audit only, never block (use to assess impact)
+#
+# Prerequisites:
+#   kubectl apply -f https://raw.githubusercontent.com/open-policy-agent/gatekeeper/release-3.14/deploy/gatekeeper.yaml
+#
+# Apply:
+#   kubectl apply -f policies/require-resource-limits.yaml
+#   kubectl get constrainttemplate requireresourcelimits
+#   kubectl get constraint requireresourcelimits-keda-demo
+#
+# Test:
+#   # Should fail (no limits):
+#   kubectl run test-no-limits --image=nginx -n keda-demo
+#
+#   # Should succeed (has limits):
+#   kubectl run test-with-limits --image=nginx -n keda-demo \
+#     --limits='cpu=100m,memory=128Mi'
+# =============================================================================
+
+# ── Step 1: ConstraintTemplate (defines Rego policy logic) ───────────────────
+apiVersion: templates.gatekeeper.sh/v1
+kind: ConstraintTemplate
+metadata:
+  name: requireresourcelimits
+  annotations:
+    description: "Require cpu and memory limits on all containers"
+    metadata.gatekeeper.sh/title: "Require Resource Limits"
+    metadata.gatekeeper.sh/version: "1.0.0"
+    policy.smartscale.ai/rationale: >
+      Resource limits prevent runaway containers from starving KEDA-scaled pods.
+      Without limits, a single misbehaving container can cascade into cluster-wide
+      OOM evictions that defeat the autoscaler.
+spec:
+  crd:
+    spec:
+      names:
+        kind: RequireResourceLimits
+      validation:
+        openAPIV3Schema:
+          type: object
+          properties:
+            exemptImages:
+              type: array
+              items:
+                type: string
+              description: "Container images exempt from this policy (e.g. init containers, sidecars)"
+
+  targets:
+    - target: admission.k8s.gatekeeper.sh
+      rego: |
+        package requireresourcelimits
+
+        # Violation: container missing cpu OR memory limit
+        violation[{"msg": msg}] {
+          container := input_containers[_]
+          not is_exempt(container)
+          not has_limits(container)
+          msg := sprintf(
+            "Container '%v' in Pod '%v' must set resources.limits.cpu and resources.limits.memory. Got: %v",
+            [container.name, input.review.object.metadata.name, container.resources]
+          )
+        }
+
+        # Helper: get all containers (main + init)
+        input_containers[container] {
+          container := input.review.object.spec.containers[_]
+        }
+        input_containers[container] {
+          container := input.review.object.spec.initContainers[_]
+        }
+
+        # Helper: container has BOTH cpu and memory limits
+        has_limits(container) {
+          container.resources.limits.cpu
+          container.resources.limits.memory
+        }
+
+        # Helper: container image is in the exemptImages list
+        is_exempt(container) {
+          exempt_image := input.parameters.exemptImages[_]
+          startswith(container.image, exempt_image)
+        }
+
+---
+# ── Step 2: Constraint (instantiates the template for keda-demo namespace) ───
+apiVersion: constraints.gatekeeper.sh/v1beta1
+kind: RequireResourceLimits
+metadata:
+  name: requireresourcelimits-keda-demo
+  annotations:
+    description: "Enforce resource limits on all pods in keda-demo namespace"
+spec:
+  # enforcementAction choices:
+  #   dryrun → audit only (start here when adopting a new policy)
+  #   warn   → allow but emit a warning in admission response
+  #   deny   → hard block (production enforcement)
+  enforcementAction: warn   # Start with warn; change to deny after verifying compliance
+
+  match:
+    namespaces:
+      - keda-demo
+    kinds:
+      - apiGroups: [""]
+        kinds: ["Pod"]
+
+  parameters:
+    # Images exempt from resource limits policy
+    # Add distroless/debug or ephemeral containers used for debugging
+    exemptImages:
+      - "gcr.io/gke-release/pause"     # Kubernetes pause containers
+      - "k8s.gcr.io/pause"             # Older pause image
+      - "registry.k8s.io/pause"        # Current pause image
