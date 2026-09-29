@@ -1,0 +1,170 @@
+---
+# policies/require-non-root.yaml
+# =============================================================================
+# OPA Gatekeeper Policy: Require Non-Root Containers
+# =============================================================================
+#
+# What this policy does:
+#   Enforces that every container runs as a non-root user by requiring
+#   ONE of:
+#     spec.securityContext.runAsNonRoot: true    (pod-level)
+#     spec.containers[].securityContext.runAsNonRoot: true (container-level)
+#     spec.containers[].securityContext.runAsUser: N (where N > 0)
+#
+# Why running as root is dangerous in Kubernetes:
+#   1. Container escape: if a vulnerability allows escaping the container
+#      sandbox, a root process has root on the host node — full compromise.
+#   2. Kubernetes RBAC bypass: root containers can read sensitive
+#      /proc/1/environ, hostPath mounts, and service account tokens.
+#   3. Docker daemon socket: if mounted, root can escape trivially.
+#   4. AWS EKS IRSA: the IRSA token at /var/run/secrets/... is readable
+#      by all processes; a root process in one pod could impersonate
+#      another pod's service account if node-level access is achieved.
+#
+# How this integrates with SmartScale AI:
+#   keda-demo-app runs Python workers that consume SQS messages.
+#   Python workers do not need root. The Dockerfile should use:
+#     RUN adduser --disabled-password --gecos '' appuser
+#     USER appuser
+#   This policy enforces that nobody bypasses this by setting
+#   securityContext.runAsUser: 0 in a manifest override.
+#
+# Apply:
+#   kubectl apply -f policies/require-non-root.yaml
+#   kubectl get constrainttemplate requirenonroot
+#   kubectl get constraint requirenonroot-keda-demo
+#
+# Test (should fail — runs as root):
+#   kubectl run test-root --image=nginx -n keda-demo
+#
+# Test (should succeed — explicit non-root):
+#   kubectl run test-nonroot --image=nginx -n keda-demo \
+#     --overrides='{"spec":{"securityContext":{"runAsNonRoot":true,"runAsUser":1000}}}'
+# =============================================================================
+
+# ── ConstraintTemplate: Rego policy logic ─────────────────────────────────────
+apiVersion: templates.gatekeeper.sh/v1
+kind: ConstraintTemplate
+metadata:
+  name: requirenonroot
+  annotations:
+    description: "Require containers to run as non-root user"
+    metadata.gatekeeper.sh/title: "Require Non-Root User"
+    metadata.gatekeeper.sh/version: "1.0.0"
+    policy.smartscale.ai/rationale: >
+      Root containers increase blast radius of container escapes. EKS IRSA
+      token exposure risk is elevated when containers run as UID 0.
+spec:
+  crd:
+    spec:
+      names:
+        kind: RequireNonRoot
+      validation:
+        openAPIV3Schema:
+          type: object
+          properties:
+            exemptImages:
+              type: array
+              items:
+                type: string
+              description: "Container images exempt from non-root requirement"
+            allowedUIDs:
+              type: array
+              items:
+                type: integer
+              description: "Specific UIDs that are allowed (must be > 0)"
+
+  targets:
+    - target: admission.k8s.gatekeeper.sh
+      rego: |
+        package requirenonroot
+
+        # Violation: container does not satisfy non-root requirement
+        violation[{"msg": msg}] {
+          container := input_containers[_]
+          not is_exempt(container)
+          not is_nonroot(container)
+          msg := sprintf(
+            "Container '%v' in Pod '%v' must run as non-root. Set securityContext.runAsNonRoot: true or securityContext.runAsUser > 0.",
+            [container.name, input.review.object.metadata.name]
+          )
+        }
+
+        # Collect main containers + init containers
+        input_containers[container] {
+          container := input.review.object.spec.containers[_]
+        }
+        input_containers[container] {
+          container := input.review.object.spec.initContainers[_]
+        }
+
+        # Container is non-root if ANY of these conditions hold:
+        #   1. Pod-level runAsNonRoot: true
+        #   2. Container-level runAsNonRoot: true
+        #   3. Container-level runAsUser > 0
+        is_nonroot(container) {
+          input.review.object.spec.securityContext.runAsNonRoot == true
+        }
+        is_nonroot(container) {
+          container.securityContext.runAsNonRoot == true
+        }
+        is_nonroot(container) {
+          container.securityContext.runAsUser > 0
+        }
+
+        # Exempt specific images (pause, node-agent sidecars, etc.)
+        is_exempt(container) {
+          exempt_image := input.parameters.exemptImages[_]
+          startswith(container.image, exempt_image)
+        }
+
+---
+# ── Constraint: Apply to keda-demo namespace ──────────────────────────────────
+apiVersion: constraints.gatekeeper.sh/v1beta1
+kind: RequireNonRoot
+metadata:
+  name: requirenonroot-keda-demo
+  annotations:
+    description: "Enforce non-root containers in keda-demo namespace"
+spec:
+  # Start with warn → audit violations without blocking
+  # Promote to deny after confirming all pods set runAsNonRoot or runAsUser > 0
+  enforcementAction: warn
+
+  match:
+    namespaces:
+      - keda-demo
+    kinds:
+      - apiGroups: [""]
+        kinds: ["Pod"]
+    # Exclude Gatekeeper's own system resources
+    excludedNamespaces:
+      - gatekeeper-system
+      - kube-system
+
+  parameters:
+    exemptImages:
+      - "gcr.io/gke-release/pause"
+      - "k8s.gcr.io/pause"
+      - "registry.k8s.io/pause"
+      # ElasticMQ (local SQS substitute) runs as root by default
+      # TODO: switch to softwaremill/elasticmq-native which supports non-root
+      - "softwaremill/elasticmq"
+
+---
+# ── Companion: Pod Security Standards (PSS) annotation for defence-in-depth ──
+# Kubernetes 1.23+ has built-in Pod Security Standards that complement OPA.
+# Apply the "restricted" profile to the keda-demo namespace:
+#
+#   kubectl label namespace keda-demo \
+#     pod-security.kubernetes.io/enforce=baseline \
+#     pod-security.kubernetes.io/warn=restricted \
+#     pod-security.kubernetes.io/audit=restricted
+#
+# Baseline:  Blocks privileged pods, hostPath mounts (minimum bar)
+# Restricted: Also requires runAsNonRoot, read-only root filesystem, etc.
+# Warn mode: Allows restricted violations but logs warning (safe rollout)
+#
+# PSS + OPA Gatekeeper = defence-in-depth:
+#   PSS catches the broad strokes quickly.
+#   OPA catches custom business rules (e.g., exemptImages, approved registries).
