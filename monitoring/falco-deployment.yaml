@@ -1,0 +1,268 @@
+---
+# monitoring/falco-deployment.yaml — Falco DaemonSet for EKS
+# =============================================================================
+# Deploys Falco as a DaemonSet so every EKS node gets a Falco agent.
+# Falco must run on every node because it intercepts kernel system calls —
+# it needs to be co-located with the containers it monitors.
+#
+# Architecture on EKS:
+#   Each EKS worker node runs:
+#     - N application pods (keda-demo, prediction-api, dlq-processor, etc.)
+#     - 1 Falco agent pod (this DaemonSet)
+#
+#   Falco uses the eBPF probe (preferred over kernel module on EKS):
+#     - No kernel module installation required
+#     - Works with Amazon Linux 2 / Bottlerocket without headers
+#     - Lower overhead than legacy kernel module approach
+#     - FALCO_DRIVER_TYPE=ebpf enables eBPF mode
+#
+# Alert routing:
+#   Falco → stdout (JSON) → Fluent Bit (monitoring/fluentbit-config.yaml)
+#   Falco → webhook → Slack/PagerDuty (via falcosidekick, shown below)
+#
+# Prerequisites:
+#   - EKS node groups with permissions to load eBPF programs
+#   - kubectl apply -f monitoring/falco-rules.yaml (ConfigMap with rules)
+#
+# Install via Helm (recommended for production):
+#   helm repo add falcosecurity https://falcosecurity.github.io/charts
+#   helm install falco falcosecurity/falco \
+#     --namespace falco --create-namespace \
+#     --set driver.kind=ebpf \
+#     --set-file customRules."smartscale-rules\.yaml"=monitoring/falco-custom-rules.yaml \
+#     --set falcosidekick.enabled=true \
+#     --set falcosidekick.config.slack.webhookurl="$SLACK_WEBHOOK_URL"
+#
+# Apply (raw manifests, for demo):
+#   kubectl apply -f monitoring/falco-deployment.yaml
+# =============================================================================
+
+---
+# Namespace for Falco components
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: falco
+  labels:
+    app.kubernetes.io/name: falco
+    # Exempt from OPA resource-limits and non-root policies
+    # (Falco itself requires privileged access to load eBPF programs)
+    policy.smartscale.ai/exempt: "true"
+
+---
+# RBAC: ClusterRole for Falco to read pod/node metadata
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: falco
+  labels:
+    app.kubernetes.io/name: falco
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "namespaces", "nodes", "replicationcontrollers", "serviceaccounts"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments", "daemonsets", "replicasets", "statefulsets"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: falco
+  namespace: falco
+  labels:
+    app.kubernetes.io/name: falco
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: falco
+  labels:
+    app.kubernetes.io/name: falco
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: falco
+subjects:
+  - kind: ServiceAccount
+    name: falco
+    namespace: falco
+
+---
+# Falco configuration (minimal, sufficient for demo)
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: falco-config
+  namespace: falco
+  labels:
+    app.kubernetes.io/name: falco
+data:
+  falco.yaml: |
+    # Output format: JSON (parseable by Fluent Bit and falcosidekick)
+    json_output: true
+    json_include_output_property: true
+    json_include_tags_property: true
+
+    # Log to stdout (Fluent Bit DaemonSet collects from there)
+    stdout_output:
+      enabled: true
+
+    # Enable gRPC API for falcosidekick integration
+    grpc:
+      enabled: true
+      bind_address: "unix:///run/falco/falco.sock"
+    grpc_output:
+      enabled: true
+
+    # Rules files (built-in + our custom rules)
+    rules_files:
+      - /etc/falco/falco_rules.yaml            # Falco built-in rules
+      - /etc/falco/falco_rules.local.yaml      # Local overrides
+      - /etc/falco/custom/smartscale-rules.yaml # SmartScale custom rules
+
+    # Log level: info (verbose enough to debug rule matching)
+    log_level: info
+    log_stderr: true
+
+    # Syscall buffer size (increase on busy nodes with many containers)
+    syscall_buf_size_preset: medium
+
+---
+# DaemonSet: one Falco pod per EKS node
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: falco
+  namespace: falco
+  labels:
+    app.kubernetes.io/name: falco
+    app.kubernetes.io/component: runtime-security
+    app.kubernetes.io/part-of: smartscale-ai
+  annotations:
+    smartscale.ai/description: "Falco runtime security DaemonSet — monitors syscalls on every node"
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: falco
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: falco
+        app.kubernetes.io/component: runtime-security
+      annotations:
+        # DO NOT scrape Falco directly (use falcosidekick for metrics)
+        prometheus.io/scrape: "false"
+    spec:
+      serviceAccountName: falco
+      # Falco must run on every node including control-plane taints
+      tolerations:
+        - effect: NoSchedule
+          operator: Exists
+        - effect: NoExecute
+          operator: Exists
+
+      # Host PID namespace required to monitor host processes
+      hostPID: true
+      # Host network required to see all container network connections
+      hostNetwork: true
+
+      # Priority: Falco should survive node pressure evictions
+      priorityClassName: system-node-critical
+
+      containers:
+        - name: falco
+          image: falcosecurity/falco-no-driver:0.37.1
+          imagePullPolicy: IfNotPresent
+
+          args:
+            - /usr/bin/falco
+            - --config=/etc/falco/falco.yaml
+            - -pk     # Print K8s metadata (pod name, namespace) in output
+
+          env:
+            # Use eBPF driver (preferred for EKS — no kernel module needed)
+            - name: FALCO_DRIVER_TYPE
+              value: "ebpf"
+
+            # eBPF probe is automatically compiled for the running kernel
+            - name: FALCO_BPF_PROBE
+              value: ""
+
+          securityContext:
+            # Falco REQUIRES privileged to load eBPF programs and access /proc
+            # This is the ONE legitimate use of privileged: true in the cluster
+            privileged: true
+
+          volumeMounts:
+            # eBPF probe compilation artifacts
+            - mountPath: /root/.falco
+              name: falco-probe-cache
+
+            # Host /proc for process inspection
+            - mountPath: /host/proc
+              name: proc-fs
+              readOnly: true
+
+            # Host /dev for device events
+            - mountPath: /host/dev
+              name: dev-fs
+              readOnly: true
+
+            # Falco configuration file
+            - mountPath: /etc/falco/falco.yaml
+              name: falco-config
+              subPath: falco.yaml
+
+            # SmartScale custom rules
+            - mountPath: /etc/falco/custom/smartscale-rules.yaml
+              name: falco-custom-rules
+              subPath: smartscale-rules.yaml
+
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8765
+            initialDelaySeconds: 60
+            periodSeconds: 15
+
+      volumes:
+        - name: falco-probe-cache
+          emptyDir: {}
+
+        - name: proc-fs
+          hostPath:
+            path: /proc
+
+        - name: dev-fs
+          hostPath:
+            path: /dev
+
+        - name: falco-config
+          configMap:
+            name: falco-config
+
+        - name: falco-custom-rules
+          configMap:
+            name: falco-custom-rules
+
+      # Prevent Falco from being evicted before application pods
+      priorityClassName: system-node-critical
+
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1   # Update one node at a time to maintain coverage
