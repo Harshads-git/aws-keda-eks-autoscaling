@@ -1,0 +1,156 @@
+---
+# gitops/argocd-project.yaml — ArgoCD AppProject for SmartScale AI
+# =============================================================================
+# An AppProject defines the security boundary for ArgoCD Applications.
+# Without AppProject restrictions, any ArgoCD Application could:
+#   - Deploy from any Git repository
+#   - Deploy to any cluster/namespace
+#   - Create any Kubernetes resource (including ClusterRoles, Secrets)
+#
+# The smartscale-ai AppProject restricts:
+#   sourceRepos:  Only our GitHub repository can be used as a source
+#   destinations: Only the keda-demo namespace on the local cluster
+#   clusterResourceWhitelist: Only specific cluster-scoped resources allowed
+#   namespaceResourceWhitelist: All namespace-scoped resources allowed
+#   namespaceResourceBlacklist: Dangerous resources explicitly denied
+#   roles: Read-only viewer role for developers, admin role for CI
+#
+# Why AppProject matters for security:
+#   If an attacker compromises ArgoCD credentials, the AppProject limits
+#   blast radius: they cannot deploy to kube-system or create ClusterRoles.
+#
+# Apply:
+#   kubectl apply -f gitops/argocd-project.yaml
+#
+# View project:
+#   argocd proj get smartscale-ai
+#   argocd proj role list smartscale-ai
+# =============================================================================
+
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: smartscale-ai
+  namespace: argocd
+  labels:
+    app.kubernetes.io/name: smartscale-ai
+    app.kubernetes.io/component: gitops
+  annotations:
+    smartscale.ai/description: "ArgoCD AppProject scoping SmartScale AI deployments"
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+
+spec:
+  description: "SmartScale AI — KEDA EKS autoscaling project (keda-demo namespace)"
+
+  # ── Allowed source repositories ───────────────────────────────────────────
+  # Only manifests from this GitHub repository can be synced.
+  # An attacker who compromises ArgoCD cannot point it at a malicious repo.
+  sourceRepos:
+    - https://github.com/Harshads-git/aws-keda-eks-autoscaling.git
+    # Allow Helm chart repos for KEDA, Falco (needed if using Helm sources)
+    - https://kedacore.github.io/charts
+    - https://falcosecurity.github.io/charts
+
+  # ── Allowed destination clusters and namespaces ───────────────────────────
+  destinations:
+    - server: https://kubernetes.default.svc   # In-cluster only (no remote clusters)
+      namespace: keda-demo                      # Application workloads namespace
+
+    - server: https://kubernetes.default.svc
+      namespace: monitoring                     # Prometheus, Grafana, Alertmanager
+
+    - server: https://kubernetes.default.svc
+      namespace: falco                          # Falco DaemonSet namespace
+
+    # NOT allowed: kube-system, default, gatekeeper-system, argocd
+    # These are managed by platform team, not application GitOps
+
+  # ── Cluster-scoped resource permissions ───────────────────────────────────
+  # Controls which cluster-level resources this project can manage.
+  # Be conservative: only allow what's strictly necessary.
+  clusterResourceWhitelist:
+    # KEDA resources are cluster-scoped
+    - group: keda.sh
+      kind: ClusterTriggerAuthentication
+    # Falco requires ClusterRole/ClusterRoleBinding for pod metadata
+    - group: rbac.authorization.k8s.io
+      kind: ClusterRole
+    - group: rbac.authorization.k8s.io
+      kind: ClusterRoleBinding
+    # OPA Gatekeeper ConstraintTemplates are cluster-scoped
+    - group: templates.gatekeeper.sh
+      kind: ConstraintTemplate
+    # Prometheus CRDs (ServiceMonitor, PrometheusRule)
+    - group: monitoring.coreos.com
+      kind: PrometheusRule
+    - group: monitoring.coreos.com
+      kind: ClusterRole
+
+  # ── Namespace-scoped resource blacklist ───────────────────────────────────
+  # Even within allowed namespaces, explicitly DENY dangerous resource types.
+  namespaceResourceBlacklist:
+    # Never allow ArgoCD to manage its own resources (prevents privilege escalation)
+    - group: argoproj.io
+      kind: Application
+    - group: argoproj.io
+      kind: AppProject
+    # ResourceQuota changes could break other tenants
+    - group: ""
+      kind: ResourceQuota
+    # LimitRange changes affect all pods in namespace
+    - group: ""
+      kind: LimitRange
+
+  # ── Namespace-scoped resource whitelist ──────────────────────────────────
+  # Allow all standard namespace-scoped resources (Deployments, Services, etc.)
+  namespaceResourceWhitelist:
+    - group: "*"
+      kind: "*"    # All namespace resources allowed (blacklist above narrows this)
+
+  # ── Sync windows ─────────────────────────────────────────────────────────
+  # Prevent automated syncs during business hours on weekdays
+  # (optional: comment out for 24/7 automated sync)
+  # syncWindows:
+  #   - kind: deny
+  #     schedule: "0 9 * * 1-5"     # Block syncs Mon-Fri 9am
+  #     duration: 8h                 # For 8 hours (until 5pm)
+  #     applications: ["*"]
+  #     manualSync: true             # Allow manual syncs during blackout
+
+  # ── Project roles ─────────────────────────────────────────────────────────
+  roles:
+    # Developer role: read-only (can view sync status, logs; cannot trigger sync)
+    - name: developer
+      description: "Read-only access for developers to inspect sync status"
+      policies:
+        - p, proj:smartscale-ai:developer, applications, get, smartscale-ai/*, allow
+        - p, proj:smartscale-ai:developer, applications, sync, smartscale-ai/*, deny
+        - p, proj:smartscale-ai:developer, applications, delete, smartscale-ai/*, deny
+      groups:
+        - smartscale-developers  # Bind to SSO group (configure in ArgoCD RBAC)
+
+    # CI/CD role: can trigger manual syncs from GitHub Actions
+    - name: ci-deployer
+      description: "CI/CD pipeline role — can sync but not delete applications"
+      policies:
+        - p, proj:smartscale-ai:ci-deployer, applications, get, smartscale-ai/*, allow
+        - p, proj:smartscale-ai:ci-deployer, applications, sync, smartscale-ai/*, allow
+        - p, proj:smartscale-ai:ci-deployer, applications, create, smartscale-ai/*, deny
+        - p, proj:smartscale-ai:ci-deployer, applications, delete, smartscale-ai/*, deny
+      groups:
+        - smartscale-ci  # CI system service account group
+
+  # ── Orphaned resources monitoring ────────────────────────────────────────
+  # Alert when resources exist in keda-demo that are NOT tracked by ArgoCD.
+  # This detects resources created via kubectl by humans (should be zero in GitOps).
+  orphanedResources:
+    warn: true   # Emit warning (not error) for untracked resources
+    ignore:
+      # These resources are created dynamically (not from Git) — expected
+      - group: ""
+        kind: Secret
+        name: "keda-demo-token-*"  # SA tokens auto-created by Kubernetes
+      - group: ""
+        kind: ConfigMap
+        name: "kube-root-ca.crt"   # Injected by Kubernetes into every namespace
