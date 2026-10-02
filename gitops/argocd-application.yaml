@@ -1,0 +1,137 @@
+---
+# gitops/argocd-application.yaml — ArgoCD Application for SmartScale AI
+# =============================================================================
+# Defines an ArgoCD Application that continuously syncs the Kubernetes manifests
+# in the `manifests/` directory from GitHub to the EKS cluster.
+#
+# What GitOps means:
+#   Git is the single source of truth for cluster state.
+#   To deploy: commit changes to manifests/ → ArgoCD detects drift → applies changes.
+#   To rollback: git revert <commit> → ArgoCD syncs → cluster reverts.
+#   Nobody runs kubectl apply manually in production.
+#
+# How ArgoCD works:
+#   1. ArgoCD Agent polls GitHub every 3 minutes (or webhook triggers).
+#   2. Compares live cluster state vs desired state in Git.
+#   3. If drift detected: marks Application as "OutOfSync".
+#   4. If autoSync enabled: ArgoCD applies the diff automatically.
+#   5. All sync events are recorded in ArgoCD's audit log.
+#
+# Sync policies configured here:
+#   automated.prune: true     → Delete resources removed from Git
+#   automated.selfHeal: true  → Revert manual kubectl changes (drift correction)
+#   syncOptions.CreateNamespace: true → Auto-create keda-demo namespace if missing
+#   retry: 3 attempts with 30s backoff (handles transient API server errors)
+#
+# To apply:
+#   # Install ArgoCD first (see docs/gitops-guide.md)
+#   kubectl apply -f gitops/argocd-application.yaml
+#
+# To view status:
+#   argocd app get smartscale-ai
+#   argocd app sync smartscale-ai     # Manual sync
+#   argocd app history smartscale-ai  # Deployment history
+#   argocd app rollback smartscale-ai <history-id>  # Rollback
+# =============================================================================
+
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: smartscale-ai
+  namespace: argocd              # ArgoCD Application lives in argocd namespace
+  labels:
+    app.kubernetes.io/name: smartscale-ai
+    app.kubernetes.io/component: gitops
+    app.kubernetes.io/part-of: smartscale-ai
+  annotations:
+    argocd.argoproj.io/description: "SmartScale AI KEDA EKS autoscaling — GitOps managed"
+    # Link to the project documentation
+    smartscale.ai/docs: "https://github.com/Harshads-git/aws-keda-eks-autoscaling/tree/main/docs"
+  # Important: finalizer ensures ArgoCD cleans up resources when Application is deleted
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+
+spec:
+  # AppProject scopes this Application to allowed repos and clusters
+  project: smartscale-ai   # Defined in argocd-project.yaml
+
+  # ── Source: where to pull manifests from ─────────────────────────────────
+  source:
+    repoURL: https://github.com/Harshads-git/aws-keda-eks-autoscaling.git
+    targetRevision: main           # Track the main branch (HEAD)
+    path: manifests               # Only sync the manifests/ directory
+    # Future: switch to 'helm' or 'kustomize' directory for multi-env promotion
+    # directory:
+    #   recurse: true              # Recurse into subdirectories
+
+  # ── Destination: where to deploy ─────────────────────────────────────────
+  destination:
+    server: https://kubernetes.default.svc   # In-cluster (ArgoCD on EKS)
+    namespace: keda-demo                      # Target namespace
+
+  # ── Sync policy ──────────────────────────────────────────────────────────
+  syncPolicy:
+    automated:
+      # prune: Delete resources that are in the cluster but NOT in Git.
+      # Without prune: deleted manifests leave orphaned resources in the cluster.
+      # With prune: Git is truly the source of truth (no ghost resources).
+      prune: true
+
+      # selfHeal: Revert manual changes made with kubectl apply/edit/delete.
+      # Without selfHeal: `kubectl delete pod X` breaks the desired state.
+      # With selfHeal: ArgoCD detects the deletion and recreates the pod.
+      # This prevents "cowboy deployments" that bypass GitOps.
+      selfHeal: true
+
+      # allowEmpty: Don't allow syncing an empty manifests/ directory.
+      # Protects against accidentally deleting everything.
+      allowEmpty: false
+
+    syncOptions:
+      - CreateNamespace=true      # Auto-create keda-demo if missing
+      - PrunePropagationPolicy=foreground   # Cascade deletes (delete pods before RS)
+      - PruneLast=true            # Prune only AFTER new resources are healthy
+      - RespectIgnoreDifferences=true       # Honour ignoreDifferences below
+
+    # Retry: handle transient sync failures (EKS API throttling, CRD install timing)
+    retry:
+      limit: 3
+      backoff:
+        duration: 30s       # First retry after 30s
+        factor: 2           # Exponential: 30s, 60s, 120s
+        maxDuration: 3m     # Never wait more than 3 minutes
+
+  # ── Ignore differences ───────────────────────────────────────────────────
+  # Some fields are mutated by controllers and should not trigger OutOfSync.
+  ignoreDifferences:
+    - group: apps
+      kind: Deployment
+      jsonPointers:
+        - /spec/replicas    # KEDA manages replica count — don't fight it
+    - group: ""
+      kind: Secret
+      jsonPointers:
+        - /data             # Secrets managed externally (AWS Secrets Manager)
+
+  # ── Health checks ────────────────────────────────────────────────────────
+  # ArgoCD uses built-in health checks for Deployment, Service, etc.
+  # Custom health checks can be added here for KEDA ScaledObjects.
+  # Default: ArgoCD marks App as Healthy when all Deployments are Available.
+
+  # ── Revision history ─────────────────────────────────────────────────────
+  revisionHistoryLimit: 10   # Keep last 10 deployments for rollback
+
+---
+# ── ArgoCD Image Updater Annotation (optional, for automated image promotion) ──
+# When using ArgoCD Image Updater, annotate the Application to auto-update
+# the image tag when a new Docker image is pushed to ECR:
+#
+# apiVersion: argoproj.io/v1alpha1
+# kind: Application
+# metadata:
+#   annotations:
+#     argocd-image-updater.argoproj.io/image-list: keda-demo=<account>.dkr.ecr.us-east-1.amazonaws.com/keda-demo-app
+#     argocd-image-updater.argoproj.io/keda-demo.update-strategy: semver
+#     argocd-image-updater.argoproj.io/keda-demo.allow-tags: regexp:^v[0-9]+\.[0-9]+\.[0-9]+$
+#
+# This automatically opens a PR or commits to Git when a new semver tag is pushed.
