@@ -1,0 +1,188 @@
+# =============================================================================
+# supply-chain/sbom-policy.yaml — SBOM Verification Policy
+# =============================================================================
+# Defines the SBOM generation and verification requirements for SmartScale AI.
+# This file serves as:
+#   1. Documentation of SBOM requirements (what must be generated, when)
+#   2. Policy for CI enforcement (checked by sbom-policy-check.sh)
+#   3. Compliance evidence (stored in Git for audit trail)
+#
+# How to use:
+#   This YAML is read by scripts and CI steps to verify that:
+#   - An SBOM was generated for the current image
+#   - The SBOM is signed (SLSA Level 2+)
+#   - No prohibited licenses are present
+#   - No CRITICAL vulnerabilities are unaddressed
+#
+# Future integration:
+#   When using OPA (Open Policy Agent) for supply chain policy:
+#     opa eval --data supply-chain/sbom-policy.yaml --input sbom.json \
+#       'data.sbom_policy.deny'
+# =============================================================================
+
+# ── Policy metadata ───────────────────────────────────────────────────────────
+policy:
+  name: smartscale-ai-sbom-policy
+  version: "1.0.0"
+  effective_date: "2026-10-03"
+  owner: "Harshads-git"
+  review_cycle: quarterly
+
+  description: >
+    SBOM generation, verification, and compliance requirements for all
+    SmartScale AI container images and release artifacts.
+
+# ── SBOM generation requirements ─────────────────────────────────────────────
+generation:
+  required: true
+  tool: syft
+  tool_minimum_version: "1.0.0"
+
+  formats:
+    # SPDX is required (ISO standard, widest compliance tool support)
+    - format: spdx-json
+      required: true
+      filename_pattern: "sbom-*-spdx.json"
+
+    # CycloneDX is required for Dependency Track integration
+    - format: cyclonedx-json
+      required: true
+      filename_pattern: "sbom-*-cyclonedx.json"
+
+  triggers:
+    # SBOM must be generated on these events (enforced by GitHub Actions)
+    - event: push_to_main
+      scope: [docker_image, application_directory]
+    - event: pull_request
+      scope: [application_directory]     # Image SBOM on PRs is optional (slow)
+    - event: release_published
+      scope: [docker_image, application_directory]
+      attachment: required               # SBOM must be attached to release assets
+
+  # SBOM artifact retention
+  retention:
+    ci_artifacts: 90_days               # GitHub Actions artifact retention
+    release_assets: indefinite          # Attached to release, kept forever
+    audit_log: indefinite               # Git history is the audit log
+
+# ── Vulnerability policy ──────────────────────────────────────────────────────
+vulnerability:
+  scanner: grype
+  scan_from_sbom: true   # Use SBOM as input to Grype (not re-scan image)
+
+  blocking_severities:
+    - CRITICAL            # Block PR merge
+    - HIGH                # Block PR merge
+
+  non_blocking_severities:
+    - MEDIUM              # Logged, tracked, fix within 30 days
+    - LOW                 # Logged, fix opportunistically
+    - NEGLIGIBLE          # Logged only
+
+  ignore_unfixed: true    # Don't block on CVEs with no available fix
+
+  sla:
+    CRITICAL: 0_days      # Fix before merge (CI blocks)
+    HIGH: 7_days          # Fix within current sprint
+    MEDIUM: 30_days       # Fix within month
+    LOW: 90_days          # Fix opportunistically
+
+# ── License policy ────────────────────────────────────────────────────────────
+license:
+  check_required: true
+  tool: syft             # SPDX license fields from Syft output
+
+  # Licenses that are ALWAYS allowed (permissive)
+  allowed:
+    - MIT
+    - Apache-2.0
+    - BSD-2-Clause
+    - BSD-3-Clause
+    - ISC
+    - PSF-2.0
+    - Python-2.0
+    - Unlicense
+    - CC0-1.0
+    - WTFPL
+    - LGPL-2.1
+    - LGPL-3.0
+    - MPL-2.0           # Weak copyleft, allowed with source disclosure for modified files
+
+  # Licenses that require LEGAL REVIEW before use
+  review_required:
+    - EUPL-1.1
+    - EUPL-1.2
+    - CDDL-1.0
+    - EPL-1.0
+    - EPL-2.0
+
+  # Licenses that are PROHIBITED (copyleft affects entire codebase)
+  prohibited:
+    - GPL-2.0
+    - GPL-2.0-only
+    - GPL-2.0-or-later
+    - GPL-3.0
+    - GPL-3.0-only
+    - GPL-3.0-or-later
+    - AGPL-3.0
+    - AGPL-3.0-only
+    - AGPL-3.0-or-later
+    - SSPL-1.0
+
+  # Packages exempt from license policy (documented exceptions)
+  exceptions: []         # No exceptions currently — all deps are permissive
+
+# ── Attestation and signing ───────────────────────────────────────────────────
+attestation:
+  # Current status: SLSA Level 1 (SBOM generated, not yet signed)
+  current_slsa_level: 1
+  target_slsa_level: 2
+
+  signing:
+    required: false      # Not yet enforced (will enable with cosign)
+    tool: cosign
+    identity_provider: github_oidc
+    transparency_log: rekor.sigstore.dev
+
+  # When signing is enabled, verification command:
+  # cosign verify-attestation \
+  #   --type spdx \
+  #   --certificate-identity-regexp "https://github.com/Harshads-git/.*" \
+  #   --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+  #   ghcr.io/harshads-git/keda-demo-app:<tag>
+
+# ── Approved base images ──────────────────────────────────────────────────────
+base_images:
+  # Only these base images are approved for use in Dockerfile
+  approved:
+    - image: python
+      tags: ["3.12-slim", "3.11-slim", "3.10-slim"]
+      reason: "Official Python slim images, minimal attack surface"
+
+    - image: gcr.io/distroless/python3
+      tags: ["latest", "nonroot"]
+      reason: "Distroless: no shell, no package manager, minimal CVE surface"
+
+  # Prohibited base images (large attack surface)
+  prohibited:
+    - image: python
+      tags: ["latest", "3.12", "3.12-full"]
+      reason: "Full images include compilers and tools not needed at runtime"
+
+    - image: ubuntu
+      reason: "Large image, many OS packages, high CVE count"
+
+# ── Compliance summary ────────────────────────────────────────────────────────
+compliance:
+  frameworks:
+    - name: US Executive Order 14028
+      status: partial    # SBOM generated; signing not yet implemented
+      requirement: "SBOM for all software sold to US government"
+
+    - name: NIST SP 800-161
+      status: partial
+      requirement: "Supply chain risk management"
+
+    - name: CIS Docker Benchmark
+      status: compliant
+      requirement: "Verified by Trivy config scan in security-scan.yml"
