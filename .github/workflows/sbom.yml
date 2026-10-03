@@ -1,0 +1,186 @@
+# =============================================================================
+# .github/workflows/sbom.yml — Software Bill of Materials Generation
+# =============================================================================
+# Generates a Software Bill of Materials (SBOM) for every Docker image built
+# in CI using Anchore Syft and attaches it to the GitHub release as an artifact.
+#
+# What is an SBOM?
+#   A machine-readable list of every component in a software artifact:
+#   OS packages, Python pip packages, their versions, licenses, and hashes.
+#   Like a nutrition label for software — required by US Executive Order 14028
+#   and increasingly mandated by enterprise procurement teams.
+#
+# SBOM formats supported:
+#   SPDX (Software Package Data Exchange) — ISO/IEC 5962 standard
+#   CycloneDX — OWASP standard, best support for vulnerability enrichment
+#   Syft JSON — native Syft format for tooling integration
+#
+# Why Syft?
+#   - Free and open-source (Anchore)
+#   - Generates SBOMs from Docker images, directories, or OCI tarballs
+#   - Outputs SPDX, CycloneDX, and Syft JSON
+#   - Integrates with Grype for SBOM-driven vulnerability scanning
+#   - Official GitHub Action: anchore/sbom-action
+#
+# What we generate:
+#   1. SBOM of the Docker image (keda-demo-app:latest)
+#      → Catches ALL packages inside the container (OS + pip + transitive)
+#   2. SBOM of the Python application directory
+#      → Quick check during PRs without needing a full image build
+#
+# Artifacts:
+#   sbom-image-spdx.json    → Attached to GitHub Release
+#   sbom-image-cyclonedx.json → For Dependency Track / SBOM portal
+#   sbom-app-spdx.json      → Application-layer SBOM (no OS packages)
+# =============================================================================
+
+name: Supply Chain — SBOM Generation
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "application/**"
+      - "Dockerfile"
+      - ".github/workflows/sbom.yml"
+
+  pull_request:
+    branches: [main]
+    paths:
+      - "application/**"
+      - "Dockerfile"
+
+  # Generate SBOM for every release tag (for compliance attestation)
+  release:
+    types: [published]
+
+  workflow_dispatch:
+
+permissions:
+  contents: write        # Write release assets
+  packages: write        # Push to GHCR (if using GitHub Container Registry)
+  id-token: write        # For OIDC-based attestation (SLSA provenance)
+
+jobs:
+  # ── Job 1: Generate Docker Image SBOM ────────────────────────────────────────
+  sbom-image:
+    name: SBOM — Docker Image (SPDX + CycloneDX)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Build Docker image for SBOM generation
+        run: |
+          docker build -t keda-demo-app:sbom ./application
+          echo "✅ Image built: keda-demo-app:sbom"
+
+      - name: Generate SBOM (SPDX format)
+        uses: anchore/sbom-action@v0
+        with:
+          image: keda-demo-app:sbom
+          format: spdx-json
+          output-file: sbom-image-spdx.json
+          artifact-name: sbom-image-spdx
+          upload-artifact: true
+          upload-artifact-retention: 90
+
+      - name: Generate SBOM (CycloneDX format)
+        uses: anchore/sbom-action@v0
+        with:
+          image: keda-demo-app:sbom
+          format: cyclonedx-json
+          output-file: sbom-image-cyclonedx.json
+          artifact-name: sbom-image-cyclonedx
+          upload-artifact: true
+          upload-artifact-retention: 90
+
+      - name: Scan SBOM for vulnerabilities with Grype
+        # Grype uses the generated SBOM to find CVEs — faster than rebuilding
+        # because it uses the already-generated component list
+        uses: anchore/scan-action@v3
+        with:
+          sbom: sbom-image-spdx.json
+          severity-cutoff: high
+          fail-build: true
+          output-format: sarif
+        continue-on-error: true   # Don't block SBOM upload on vulnerability finding
+
+      - name: Upload Grype SARIF to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: results.sarif
+          category: grype-sbom
+
+      - name: Print SBOM summary
+        run: |
+          echo "=== SBOM Package Count ==="
+          cat sbom-image-spdx.json | python3 -c "
+          import json, sys
+          data = json.load(sys.stdin)
+          pkgs = data.get('packages', [])
+          print(f'Total packages: {len(pkgs)}')
+          os_pkgs = [p for p in pkgs if p.get('primaryPackagePurpose') == 'OPERATING-SYSTEM']
+          py_pkgs = [p for p in pkgs if 'python' in p.get('name','').lower() or 'pip' in str(p.get('externalRefs',[])).lower()]
+          print(f'OS packages: {len(os_pkgs)}')
+          print(f'Python packages (approx): {len(py_pkgs)}')
+          "
+
+  # ── Job 2: Generate Application SBOM (fast, no image build) ──────────────────
+  sbom-app:
+    name: SBOM — Python Application (requirements.txt)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Generate SBOM from application directory
+        uses: anchore/sbom-action@v0
+        with:
+          path: ./application
+          format: spdx-json
+          output-file: sbom-app-spdx.json
+          artifact-name: sbom-app-spdx
+          upload-artifact: true
+          upload-artifact-retention: 90
+
+      - name: Generate license report from SBOM
+        run: |
+          echo "=== License Summary ==="
+          python3 -c "
+          import json
+          data = json.load(open('sbom-app-spdx.json'))
+          licenses = {}
+          for pkg in data.get('packages', []):
+              for lic in pkg.get('licenseConcluded', '').split(' AND '):
+                  lic = lic.strip()
+                  if lic and lic != 'NOASSERTION':
+                      licenses[lic] = licenses.get(lic, 0) + 1
+          for lic, count in sorted(licenses.items(), key=lambda x: -x[1]):
+              print(f'  {lic}: {count} packages')
+          "
+
+  # ── Job 3: Attach SBOM to GitHub Release (only on release events) ────────────
+  attach-sbom-to-release:
+    name: Attach SBOM to GitHub Release
+    runs-on: ubuntu-latest
+    needs: [sbom-image, sbom-app]
+    if: github.event_name == 'release'
+
+    steps:
+      - name: Download SBOM artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: sbom-artifacts
+
+      - name: Attach SBOMs to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            sbom-artifacts/sbom-image-spdx/sbom-image-spdx.json
+            sbom-artifacts/sbom-image-cyclonedx/sbom-image-cyclonedx.json
+            sbom-artifacts/sbom-app-spdx/sbom-app-spdx.json
+          fail_on_unmatched_files: false
