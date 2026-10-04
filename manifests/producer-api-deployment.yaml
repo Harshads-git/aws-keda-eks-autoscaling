@@ -1,0 +1,177 @@
+---
+# manifests/producer-api-deployment.yaml — Producer API Deployment + Service
+# =============================================================================
+# Deploys the FastAPI producer API (application/producer_api.py) to Kubernetes.
+#
+# Role in the SmartScale AI demo flow:
+#   External user/load tester
+#         │  POST /send/bulk {"count": 50}
+#         ▼
+#   producer-api (this Service, port 8091)
+#         │  SQS SendMessageBatch
+#         ▼
+#   ElasticMQ / AWS SQS
+#         │  ApproximateNumberOfMessages increases
+#         ▼
+#   KEDA ScaledObject polls depth
+#         │  desiredReplicas = ceil(depth / queueLength)
+#         ▼
+#   keda-demo Deployment scales up
+#
+# Port assignments in keda-demo namespace:
+#   8080 → main consumer (keda-demo-app)
+#   8081 → DLQ processor (keda-demo-dlq)
+#   8090 → prediction API
+#   8091 → producer API (this)
+#
+# To trigger a KEDA demo from outside the cluster:
+#   kubectl port-forward -n keda-demo svc/producer-api 8091:8091 &
+#   curl -X POST http://localhost:8091/send/bulk \
+#     -H 'Content-Type: application/json' \
+#     -d '{"count": 30, "queue_type": "priority"}'
+#   kubectl get pods -n keda-demo -w
+# =============================================================================
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: producer-api
+  namespace: keda-demo
+  labels:
+    app.kubernetes.io/name: producer-api
+    app.kubernetes.io/component: message-producer
+    app.kubernetes.io/part-of: smartscale-ai
+    app.kubernetes.io/managed-by: kubectl
+  annotations:
+    smartscale.ai/description: "SQS message producer — REST API for injecting demo load"
+spec:
+  replicas: 1   # Always-on: load testers need a stable target
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: producer-api
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: producer-api
+        app.kubernetes.io/component: message-producer
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8091"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: keda-demo-sa
+
+      containers:
+        - name: producer-api
+          image: keda-demo-app:latest
+          imagePullPolicy: IfNotPresent
+          command: ["python", "producer_api.py"]
+
+          ports:
+            - containerPort: 8091
+              name: http
+              protocol: TCP
+
+          env:
+            # ── API Configuration ──────────────────────────────────────────
+            - name: API_PORT
+              value: "8091"
+
+            # ── Queue Configuration ────────────────────────────────────────
+            - name: SQS_QUEUE_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: keda-demo-config
+                  key: SQS_QUEUE_URL
+
+            - name: PRIORITY_QUEUE_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: keda-demo-config
+                  key: SQS_QUEUE_URL   # Reuses base URL; producer appends -priority
+
+            - name: BATCH_QUEUE_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: keda-demo-config
+                  key: SQS_QUEUE_URL   # Reuses base URL; producer appends -batch
+
+            # ── AWS Configuration ──────────────────────────────────────────
+            - name: AWS_DEFAULT_REGION
+              valueFrom:
+                configMapKeyRef:
+                  name: keda-demo-config
+                  key: AWS_DEFAULT_REGION
+                  optional: true
+
+            - name: AWS_ENDPOINT_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: keda-demo-config
+                  key: AWS_ENDPOINT_URL
+                  optional: true
+
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: local-aws-secret
+                  key: AWS_ACCESS_KEY_ID
+                  optional: true
+
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: local-aws-secret
+                  key: AWS_SECRET_ACCESS_KEY
+                  optional: true
+
+            # ── Pod Metadata ───────────────────────────────────────────────
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+
+          resources:
+            requests:
+              cpu: 25m
+              memory: 64Mi
+            limits:
+              cpu: 100m
+              memory: 128Mi
+
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8091
+            initialDelaySeconds: 10
+            periodSeconds: 30
+
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8091
+            initialDelaySeconds: 5
+            periodSeconds: 10
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: producer-api
+  namespace: keda-demo
+  labels:
+    app.kubernetes.io/name: producer-api
+    app.kubernetes.io/component: message-producer
+spec:
+  selector:
+    app.kubernetes.io/name: producer-api
+  type: ClusterIP
+  ports:
+    - name: http
+      port: 8091
+      targetPort: 8091
+      protocol: TCP
