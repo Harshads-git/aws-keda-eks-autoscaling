@@ -1,0 +1,215 @@
+---
+# manifests/dashboard-deployment.yaml — SmartScale AI Live Dashboard
+# =============================================================================
+# Deploys the web dashboard (application/dashboard.py) to Kubernetes.
+#
+# Special consideration: Kubernetes API access
+#   The dashboard queries the Kubernetes API to read pod counts.
+#   This requires a ServiceAccount with permission to list Deployments
+#   in the keda-demo namespace.
+#
+#   We create a dedicated Role + RoleBinding for this (not cluster-admin!).
+#   Principle of least privilege: read-only, keda-demo namespace only.
+#
+# Access from outside the cluster:
+#   kubectl port-forward -n keda-demo svc/dashboard 8092:8092
+#   Open: http://localhost:8092
+#
+# Architecture position:
+#   The dashboard is a "view" layer — it reads from:
+#     SQS (via boto3 directly)
+#     Kubernetes API (via in-cluster service account)
+#     Prediction API (via HTTP to prediction-api service)
+#     Producer API  (proxies bulk send via HTTP to producer-api service)
+# =============================================================================
+
+# ── RBAC: Allow dashboard to read Deployments in keda-demo ───────────────────
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: dashboard-reader
+  namespace: keda-demo
+  labels:
+    app.kubernetes.io/name: dashboard
+    app.kubernetes.io/component: web-dashboard
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: dashboard-reader-binding
+  namespace: keda-demo
+  labels:
+    app.kubernetes.io/name: dashboard
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: dashboard-reader
+subjects:
+  - kind: ServiceAccount
+    name: keda-demo-sa
+    namespace: keda-demo
+
+---
+# Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dashboard
+  namespace: keda-demo
+  labels:
+    app.kubernetes.io/name: dashboard
+    app.kubernetes.io/component: web-dashboard
+    app.kubernetes.io/part-of: smartscale-ai
+  annotations:
+    smartscale.ai/description: "Real-time HTMX dashboard showing queue depths and pod counts"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: dashboard
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: dashboard
+        app.kubernetes.io/component: web-dashboard
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8092"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: keda-demo-sa
+
+      containers:
+        - name: dashboard
+          image: keda-demo-app:latest
+          imagePullPolicy: IfNotPresent
+          command: ["python", "dashboard.py"]
+
+          ports:
+            - containerPort: 8092
+              name: http
+              protocol: TCP
+
+          env:
+            - name: DASHBOARD_PORT
+              value: "8092"
+
+            - name: REFRESH_INTERVAL_SECONDS
+              value: "3"
+
+            # Queue URLs for depth reading
+            - name: SQS_QUEUE_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: keda-demo-config
+                  key: SQS_QUEUE_URL
+
+            - name: PRIORITY_QUEUE_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: keda-demo-config
+                  key: SQS_QUEUE_URL
+
+            - name: BATCH_QUEUE_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: keda-demo-config
+                  key: SQS_QUEUE_URL
+
+            # AWS credentials for SQS
+            - name: AWS_DEFAULT_REGION
+              valueFrom:
+                configMapKeyRef:
+                  name: keda-demo-config
+                  key: AWS_DEFAULT_REGION
+                  optional: true
+
+            - name: AWS_ENDPOINT_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: keda-demo-config
+                  key: AWS_ENDPOINT_URL
+                  optional: true
+
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: local-aws-secret
+                  key: AWS_ACCESS_KEY_ID
+                  optional: true
+
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: local-aws-secret
+                  key: AWS_SECRET_ACCESS_KEY
+                  optional: true
+
+            # Internal service URLs (cluster DNS)
+            - name: PREDICTION_API_URL
+              value: "http://prediction-api.keda-demo.svc.cluster.local:8090"
+
+            - name: PRODUCER_API_URL
+              value: "http://producer-api.keda-demo.svc.cluster.local:8091"
+
+            # Pod metadata for log context
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+
+          resources:
+            requests:
+              cpu: 25m
+              memory: 64Mi
+            limits:
+              cpu: 100m
+              memory: 128Mi
+
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8092
+            initialDelaySeconds: 10
+            periodSeconds: 30
+
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8092
+            initialDelaySeconds: 5
+            periodSeconds: 10
+
+---
+# Service: ClusterIP + one NodePort for local access without port-forward
+apiVersion: v1
+kind: Service
+metadata:
+  name: dashboard
+  namespace: keda-demo
+  labels:
+    app.kubernetes.io/name: dashboard
+    app.kubernetes.io/component: web-dashboard
+  annotations:
+    smartscale.ai/access: "kubectl port-forward svc/dashboard 8092:8092 -n keda-demo"
+spec:
+  selector:
+    app.kubernetes.io/name: dashboard
+  type: ClusterIP
+  ports:
+    - name: http
+      port: 8092
+      targetPort: 8092
+      protocol: TCP
