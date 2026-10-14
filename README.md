@@ -1,280 +1,230 @@
-# ⚡ SmartScale AI — Intelligent Event-Driven Autoscaling on AWS
+# ⚡ SmartScale AI — Intelligent Event-Driven Autoscaling Platform on AWS
 
-> **An AI-enhanced Kubernetes autoscaling system that predicts SQS queue depth
-> and pre-warms consumer pods before traffic spikes arrive — eliminating the
-> 40-second cold-start lag of reactive scaling.**
+> **An enterprise-grade, AI-assisted Kubernetes autoscaling platform on Amazon EKS that forecasts SQS queue depth, pre-warms consumer pods before traffic arrives, scales to zero when idle, and enforces full-stack DevSecOps and GitOps.**
+
+[![50-Day Capstone](https://img.shields.io/badge/Milestone-50%20Days%20Complete-gold?style=for-the-badge&logo=target)](docs/capstone-showcase.md)
+[![Total Commits](https://img.shields.io/badge/Commits-165+-blue?style=for-the-badge&logo=git)](docs/project-retrospective.md)
 
 [![CI](https://github.com/Harshads-git/aws-keda-eks-autoscaling/actions/workflows/ci.yml/badge.svg)](https://github.com/Harshads-git/aws-keda-eks-autoscaling/actions/workflows/ci.yml)
-[![CD](https://github.com/Harshads-git/aws-keda-eks-autoscaling/actions/workflows/deploy.yml/badge.svg)](https://github.com/Harshads-git/aws-keda-eks-autoscaling/actions/workflows/deploy.yml)
+[![Security Scan](https://github.com/Harshads-git/aws-keda-eks-autoscaling/actions/workflows/security-scan.yml/badge.svg)](docs/security-guide.md)
+[![SBOM Audit](https://github.com/Harshads-git/aws-keda-eks-autoscaling/actions/workflows/sbom.yml/badge.svg)](docs/sbom-guide.md)
 [![Python](https://img.shields.io/badge/Python-3.10%20|%203.11%20|%203.12-3776AB?logo=python&logoColor=white)](application/)
 [![Kubernetes](https://img.shields.io/badge/Kubernetes-1.29-326CE5?logo=kubernetes&logoColor=white)](manifests/)
 [![KEDA](https://img.shields.io/badge/KEDA-2.14-purple?logo=kubernetes&logoColor=white)](manifests/keda-scaled-object.yaml)
 [![AWS](https://img.shields.io/badge/AWS-EKS%20·%20SQS%20·%20ECR-FF9900?logo=amazonaws)](terraform/)
 [![Terraform](https://img.shields.io/badge/Terraform-1.6+-7B42BC?logo=terraform&logoColor=white)](terraform/)
+[![GitOps](https://img.shields.io/badge/GitOps-ArgoCD-orange?logo=argo)](gitops/)
+[![DevSecOps](https://img.shields.io/badge/Security-OPA%20·%20Falco%20·%20Trivy-green)](policies/)
 [![License](https://img.shields.io/badge/License-MIT-green)](LICENSE)
 
 ---
 
-## What This Project Does
+## 📖 Executive Overview
 
-SmartScale AI is an **AWS-native, production-grade event-driven autoscaling system** built on Amazon EKS. It goes beyond the standard KEDA SQS trigger by adding a **scikit-learn predictive scaling layer** that forecasts queue depth 5 minutes ahead, allowing Kubernetes to pre-warm consumer pods before traffic arrives.
+SmartScale AI solves the fundamental flaw of reactive Kubernetes autoscaling: **pod startup lag**.
 
-**The problem with reactive scaling:**
-```
-t=0    Traffic spike: 25 messages arrive in SQS
-t=15   KEDA detects queue depth on next poll (pollingInterval=15s)
-t=40   Pods become Ready (scheduling + startupProbe = 25s more)
-       ↑ 40 seconds of unprocessed message backlog
-```
-
-**The SmartScale AI solution:**
-```
-t=-5min  Predictor forecasts: "depth will be 25 in 5 minutes"
-t=-5min  KEDA External Scaler pre-warms 5 pods
-t=0      Traffic spike arrives → pods ALREADY RUNNING → 0s lag
+### The Problem: Reactive Cold-Start Delay
+In conventional event-driven systems using standard HPA or raw KEDA:
+```text
+t=0s    Burst traffic spike arrives in Amazon SQS (e.g. 50 messages)
+t=15s   KEDA polls SQS queue depth and calculates required replicas
+t=40s   Pods become Ready (scheduling + image pull + startup probes take 25s)
+        ↑ 40 SECONDS OF UNPROCESSED BACKLOG SPIKING P99 QUEUE LATENCY
 ```
 
----
-
-## Architecture
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    PRODUCER LAYER                               │
-│  Microservices  /  IoT Devices  /  load-test.sh                │
-└────────────────────────┬────────────────────────────────────────┘
-                         │ HTTPS / SQS API
-                         ▼
-┌─────────────────────────────────────────────────────────────────┐
-│              EVENT LAYER  (Amazon SQS)                          │
-│  ┌─────────────────────┐      ┌──────────────────────┐         │
-│  │  keda-demo-queue    │─────▶│  Dead Letter Queue   │         │
-│  │  (Visibility: 30s)  │ ×3   │  (after 3 failures)  │         │
-│  └─────────────────────┘      └──────────────────────┘         │
-└────────────────────────┬────────────────────────────────────────┘
-          poll every 15s │                    predict 5min ahead
-          ┌──────────────┘                         │
-          ▼                                         ▼
-┌───────────────────┐              ┌────────────────────────────┐
-│   KEDA Operator   │◀─GetMetrics─│  AI Predictor              │
-│   (ScaledObject)  │             │  (External Scaler, gRPC)    │
-│   HPA target:     │             │  LinearRegression model     │
-│   0 – 5 replicas  │             │  confidence-based fallback  │
-└─────────┬─────────┘              └────────────────────────────┘
-          │ scale
-          ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                 AMAZON EKS CLUSTER                              │
-│  ┌──────────────────┐     ┌───────────────────────────────┐    │
-│  │  On-Demand Node  │     │  Spot Instance Fleet          │    │
-│  │  (System pods,   │     │  t3.small/t3a.small/m5.large  │    │
-│  │   KEDA operator) │     │  Consumer pods  [0 → 5]       │    │
-│  └──────────────────┘     │  ┌─────┐ ┌─────┐ ┌─────┐    │    │
-│                            │  │ Pod │ │ Pod │ │ Pod │    │    │
-│                            │  │app.py│ │app.py│ │app.py│  │    │
-│                            │  └──┬──┘ └──┬──┘ └──┬──┘    │    │
-│                            └─────┼────────┼────────┼───────┘    │
-└──────────────────────────────────┼────────┼────────┼────────────┘
-              SQS delete_message() │        │        │
-              :8080/metrics scrape ▼        ▼        ▼
-┌─────────────────────────────────────────────────────────────────┐
-│              OBSERVABILITY  (kube-prometheus-stack)             │
-│  Prometheus ── histogram_quantile(P99) ──▶ Grafana Dashboards   │
-│  Alertmanager ── KedaDemoSlowProcessing / HighFailureRate ──▶ 📧│
-└─────────────────────────────────────────────────────────────────┘
+### The Solution: SmartScale AI Proactive Pre-Warming
+SmartScale AI combines an **ARIMA(1,1,1) time-series forecasting model** with automated confidence-gated safety fallbacks:
+```text
+t=-60s  Predictor forecasts incoming surge based on queue momentum
+t=-45s  KEDA External Scaler pre-warms consumer pods in advance
+t=0s    Traffic burst arrives → Pods are ALREADY RUNNING → 0-second queue lag
 ```
 
 ---
 
-## Key Features
+## 🏛️ End-to-End System Architecture
 
-| Feature | Details |
-|---|---|
-| **Scale to zero** | 0 pods when queue empty (KEDA minReplicaCount=0) |
-| **AI Predictive Scaling** | Scikit-learn Linear Regression predicts queue depth 5min ahead |
-| **Spot Instance fleet** | 5 instance types, 70–90% cost savings vs On-Demand |
-| **IRSA authentication** | Zero static AWS credentials — OIDC token exchange only |
-| **Prometheus metrics** | 5 custom metrics: processed, failed, duration (P99), active, SQS errors |
-| **Alerting** | 7 PrometheusRule alerts: processing stall, DLQ depth, KEDA errors |
-| **Graceful shutdown** | SIGTERM → finish in-flight message → delete /tmp/healthy → exit (40s) |
-| **Multi-environment** | Dev/Staging/Prod via Kustomize overlays + Helm values-*.yaml |
-| **Helm chart** | 10 conditional templates, 3 required values, `--atomic` CI/CD |
-| **Security** | PSS restricted, NetworkPolicy, RBAC (resourceNames-scoped), Secrets Manager stub |
-| **Chaos testing** | 5 experiments: pod-kill, scale-to-zero, network-partition, flood, spot-drain |
-| **CI matrix** | pytest on Python 3.10 / 3.11 / 3.12, chaos dry-run, Helm lint, Terraform validate |
+```text
+┌────────────────────────────────────────────────────────────────────────────────────────┐
+│                               OPERATOR & CLIENT LAYER                                  │
+│   Web Browser (Dashboard :8092)   │   REST Client (Producer :8091)   │   Pytest E2E    │
+└──────────────────┬────────────────┴──────────────────┬───────────────┴────────┬────────┘
+                   │ HTTP / HTMX                       │ POST /send/bulk        │
+                   ▼                                   ▼                        │
+┌───────────────────────────────────────────────────────────────────────┐       │
+│                       MICROSERVICES APPLICATION LAYER                 │       │
+│                                                                       │       │
+│  ┌─────────────────────────┐               ┌────────────────────────┐ │       │
+│  │   Live Web Dashboard    │               │  Message Producer API  │ │       │
+│  │       (Port 8092)       │               │      (Port 8091)       │ │       │
+│  │   FastAPI + HTMX Poller │               │  FastAPI + Batch SQS   │ │       │
+│  └────────────┬────────────┘               └───────────┬────────────┘ │       │
+│               │                                        │              │       │
+│               │ Proxies / Reads                        │ SQS Batch    │       │
+│               ▼                                        ▼              │       │
+│  ┌─────────────────────────┐               ┌────────────────────────┐ │       │
+│  │     Prediction API      │               │     AWS SQS Queues     │ │       │
+│  │       (Port 8090)       │◀─Reads Depth──│  • Priority Queue      │ │       │
+│  │  ARIMA(1,1,1) Forecast  │               │  • Batch Queue         │ │       │
+│  │  Confidence Fallback    │               │  • Dead Letter Queue   │ │       │
+│  └────────────┬────────────┘               └───────────┬────────────┘ │       │
+│               │ Recommendations                        │              │       │
+│               ▼                                        ▼              │       │
+│  ┌──────────────────────────────────────────────────────────────────┐ │       │
+│  │                    KEDA AUTOSCALER & KUBERNETES                  │ │       │
+│  │  • KEDA Operator (Polls SQS & Queries Prediction API via gRPC)   │ │       │
+│  │  • Horizontal Pod Autoscaler (HPA manages 0 → 10 replicas)       │ │       │
+│  └──────────────────────────────────┬───────────────────────────────┘ │       │
+│                                     │ Scale Events                    │       │
+│                                     ▼                                 │       │
+│  ┌──────────────────────────────────────────────────────────────────┐ │       │
+│  │                      CONSUMER WORKER FLEET                       │ │       │
+│  │  • Multi-Queue Consumer (Port 8080) — Prioritizes urgent events  │ │       │
+│  │  • DLQ Processor Pod    (Port 8081) — Isolates poison messages   │ │       │
+│  └──────────────────────────────────────────────────────────────────┘ │       │
+└───────────────────────────────────────────────────────────────────────┼───────┘
+                                                                        │
+┌───────────────────────────────────────────────────────────────────────┴────────┐
+│                        DEVSECOPS, GITOPS & OBSERVABILITY                       │
+│  ┌───────────────────────┐ ┌──────────────────────┐ ┌────────────────────────┐ │
+│  │  ArgoCD GitOps Sync   │ │  OPA Gatekeeper      │ │  Falco eBPF Runtime    │ │
+│  │  ignoreDifferences    │ │  Resource limits &   │ │  Syscall monitoring    │ │
+│  │  Self-healing drift   │ │  Non-root enforcement│ │  MITRE ATT&CK rules    │ │
+│  └───────────────────────┘ └──────────────────────┘ └────────────────────────┘ │
+│  ┌───────────────────────┐ ┌──────────────────────┐ ┌────────────────────────┐ │
+│  │  Prometheus & Grafana │ │  OpenTelemetry OTel  │ │  Syft / Grype SBOM     │ │
+│  │  SLO multi-burn-rates │ │  Trace propagation   │ │  License compliance    │ │
+│  └───────────────────────┘ └──────────────────────┘ └────────────────────────┘ │
+└────────────────────────────────────────────────────────────────────────────────┘
+```
 
 ---
 
-## Quick Start
+## 🔌 Microservice & Network Port Matrix
 
-### Prerequisites
+| Service | File | Port | Purpose |
+|---|---|---|---|
+| **Core Consumer** | [`application/app.py`](application/app.py) | `8080` | Primary SQS consumer worker with Prometheus metrics & SIGTERM handling |
+| **DLQ Processor** | [`application/dlq_processor.py`](application/dlq_processor.py) | `8081` | Dead-letter queue re-drive and poison pill quarantine |
+| **Prediction API** | [`application/prediction_api.py`](application/prediction_api.py) | `8090` | ARIMA(1,1,1) time-series forecasting & confidence-gated scaler |
+| **Producer REST API** | [`application/producer_api.py`](application/producer_api.py) | `8091` | High-throughput SQS message generator (`/send`, `/send/bulk`, `/queue/depth`) |
+| **Live Web Dashboard** | [`application/dashboard.py`](application/dashboard.py) | `8092` | Server-rendered real-time HTML dashboard with 3s HTMX partial swapping |
+
+---
+
+## 🌟 Key Capabilities by Phase
+
+### Phase 1: Observability & Tracing (Days 31–35)
+* **Prometheus & Grafana:** Custom dashboards tracking consumer throughput, failure rates, and P99 latency.
+* **Alertmanager & SLOs:** Multi-window, multi-burn-rate alerting rules protecting message latency budgets.
+* **Logging & Tracing:** Fluent Bit structured JSON streaming and OpenTelemetry distributed trace context propagation.
+
+### Phase 2: Advanced AI & Multi-Queue (Days 36–40)
+* **ARIMA(1,1,1) Forecasting:** Time-series demand forecasting handling trend momentum and mean-reverting queue bursts.
+* **Walk-Forward Model Validation:** Automated evaluator calculating MAPE against sliding test windows before activating models.
+* **Dual-Queue Routing:** Multi-queue consumer prioritizing urgent messages while processing background batch work.
+
+### Phase 3: DevSecOps, Policy as Code & GitOps (Days 41–45)
+* **Container & IaC Scanning:** Trivy auditing vulnerability CVEs in GitHub Actions CI pipelines.
+* **Admission Control:** OPA Gatekeeper constraint templates enforcing CPU/memory limits and non-root execution.
+* **Runtime Defense:** Falco eBPF syscall monitoring with custom MITRE ATT&CK security rules.
+* **GitOps Continuous Delivery:** ArgoCD declarative deployment with `ignoreDifferences` on autoscaled replicas and automated self-healing.
+* **Supply Chain Security:** Syft/Grype automated Software Bill of Materials (SBOM) and GPL license compliance enforcement.
+
+### Phase 4: Full-Stack Capstone (Days 46–50)
+* **Producer API:** REST interface with 10-message batch chunking for load testing and demo orchestration.
+* **HTMX Web Dashboard:** Zero-build, single-container live operations UI with automated 3s DOM swapping.
+* **Pytest E2E Test Suite:** Complete integration harness testing health, predictions, queue lifecycle, and closed-loop scaling.
+* **Architecture Governance:** Formal Architecture Decision Records (ADRs 0001, 0002, 0003).
+
+---
+
+## 🚀 Quick Start Guide
+
+### Option 1: 5-Minute Local Demo (Zero AWS Cost)
+
+Run the full platform locally using Docker Desktop, Kind, and ElasticMQ:
 
 ```bash
+# 1. Clone repository
 git clone https://github.com/Harshads-git/aws-keda-eks-autoscaling.git
 cd aws-keda-eks-autoscaling
 
-# Tools required: aws-cli >= 2.13, terraform >= 1.6, kubectl >= 1.28, helm >= 3.12
+# 2. Deploy local manifests to Kind cluster
+kubectl apply -f manifests/
+
+# 3. Port-forward the Live Dashboard and Producer API
+kubectl port-forward -n keda-demo svc/dashboard 8092:8092 &
+kubectl port-forward -n keda-demo svc/producer-api 8091:8091 &
+
+# 4. Open Dashboard in Browser
+# http://localhost:8092
+
+# 5. Inject a burst of 30 messages to trigger autoscaling
+curl -X POST http://localhost:8091/send/bulk \
+  -H "Content-Type: application/json" \
+  -d '{"count": 30, "queue_type": "priority"}'
+
+# 6. Watch pods scale from 1 to 8/10 replicas on the dashboard!
 ```
 
-### 1. Provision AWS Infrastructure
+### Option 2: Deploy to Real AWS EKS
 
 ```bash
+# 1. Provision Infrastructure via Terraform
 cd terraform
-cp terraform.tfvars.example terraform.tfvars   # Fill in your values
 terraform init
-terraform plan
 terraform apply
 
-# Outputs you'll need:
-terraform output sqs_queue_url
-terraform output consumer_role_arn
-terraform output ecr_repository_url
+# 2. Deploy via ArgoCD GitOps
+kubectl apply -f gitops/argocd-project.yaml
+kubectl apply -f gitops/argocd-application.yaml
+
+# 3. Monitor sync and autoscaling
+argocd app get smartscale-ai
 ```
 
-### 2. Build and Push the Consumer Image
+---
+
+## 🧪 Testing Suites
 
 ```bash
-export ECR_URI=$(terraform output -raw ecr_repository_url)
-aws ecr get-login-password | docker login --username AWS --password-stdin "$ECR_URI"
-docker build -t "$ECR_URI:latest" application/
-docker push "$ECR_URI:latest"
-```
+# Install dependencies
+pip install -r application/requirements.txt pytest moto
 
-### 3. Deploy to Kubernetes
+# 1. Unit Tests (Consumer, DLQ, Predictor)
+pytest application/test_app.py application/test_producer_api.py -v
 
-```bash
-# Option A: Kustomize (simple)
-export KUBECONFIG=$(terraform output -raw kubeconfig_path)
-kubectl apply -k kustomize/overlays/dev/
+# 2. AI Model Walk-Forward & Backtesting Tests
+pytest ai/test_predictor.py -v
 
-# Option B: Helm (recommended for prod)
-export QUEUE_URL=$(terraform output -raw sqs_queue_url)
-export CONSUMER_ROLE_ARN=$(terraform output -raw consumer_role_arn)
-helm upgrade --install keda-demo ./helm/keda-demo \
-  --set image.repository="$ECR_URI" \
-  --set image.tag=latest \
-  --set aws.sqsQueueUrl="$QUEUE_URL" \
-  --set aws.irsaRoleArn="$CONSUMER_ROLE_ARN" \
-  --atomic --timeout 5m
-
-# Option C: deploy wrapper script
-bash scripts/deploy-environment.sh dev
-```
-
-### 4. Test the Autoscaling
-
-```bash
-export QUEUE_URL=$(terraform output -raw sqs_queue_url)
-
-# Send 25 messages and watch KEDA scale 0 → 5 pods
-bash scripts/load-test.sh --scenario burst --count 25
-
-# Watch pods in real time (another terminal)
-watch -n 3 kubectl get pods -n keda-demo
-```
-
-### 5. Run Tests Locally (No AWS Needed)
-
-```bash
-pip install -r application/requirements.txt -r application/requirements-dev.txt
-
-# Unit tests (moto mocks SQS)
-pytest application/test_app.py -v
-
-# Chaos / resilience tests
+# 3. Chaos Engineering & Resilience Tests
 pytest application/chaos_test.py -v
 
-# Performance micro-benchmarks
-pytest application/performance_test.py -v -s
-
-# AI predictor demo
-python ai/predictor.py
+# 4. Full End-to-End Integration Tests
+pytest tests/e2e/ -v
 ```
 
 ---
 
-## Project Structure
+## 📚 Documentation Index
 
-```
-aws-keda-eks-autoscaling/
-│
-├── application/               # Python SQS consumer
-│   ├── app.py                 # Main consumer with SIGTERM handler + Prometheus metrics
-│   ├── test_app.py            # Unit tests (moto — no AWS account needed)
-│   ├── chaos_test.py          # Resilience tests (SIGTERM, error handling, health file)
-│   └── performance_test.py    # P99 latency micro-benchmarks
-│
-├── ai/                        # Predictive scaling AI prototype
-│   ├── predictor.py           # Scikit-learn LinearRegression queue depth predictor
-│   ├── keda_external_scaler_stub.py  # KEDA gRPC External Scaler integration
-│   └── test_predictor.py      # AI model unit tests
-│
-├── terraform/                 # All AWS infrastructure as IaC
-│   └── modules/               # vpc · eks · sqs · irsa · monitoring
-│
-├── manifests/                 # Raw Kubernetes YAML (13 files)
-├── helm/keda-demo/            # Helm chart (10 templates, values-{staging,prod}.yaml)
-├── kustomize/                 # Kustomize overlays: dev · staging · prod
-│
-├── scripts/                   # Operational scripts
-│   ├── load-test.sh           # Burst/ramp/wave load scenarios + scale-up timing
-│   ├── benchmark.sh           # Prometheus P50/P95/P99 latency queries + SLO gates
-│   ├── chaos-test.sh          # 5 chaos experiments: pod-kill, flood, spot-drain, …
-│   ├── deploy-environment.sh  # Multi-env deploy wrapper (Kustomize or Helm)
-│   ├── deploy-all-manifests.sh # 7-step ordered manifest deploy
-│   └── cleanup.sh             # Safe AWS resource teardown in dependency order
-│
-└── docs/                      # 13 guides
-    ├── architecture.md        # IRSA trust chain, KEDA math, VPC design
-    ├── helm-guide.md          # Chart usage, rollback, dry-run
-    ├── security-guide.md      # 5-layer security model, RBAC, PSS
-    ├── observability-guide.md # PromQL queries, alert runbook
-    ├── chaos-engineering-guide.md  # Hypothesis model, GameDay runbook
-    ├── ai-scaling-guide.md    # Predictive vs reactive, model roadmap
-    ├── performance-guide.md   # SLOs, scale-up budget, tuning knobs
-    └── contributing.md        # Dev setup, commit conventions, architecture rules
-```
+| Guide | Description |
+|---|---|
+| [**Capstone Portfolio Showcase**](docs/capstone-showcase.md) | Executive presentation, cost analysis, benchmarks, and portfolio summary |
+| [**50-Day Engineering Retrospective**](docs/project-retrospective.md) | Architectural evolution, challenges solved, quantitative metrics, lessons learned |
+| [**Architecture Decision Records (ADRs)**](docs/adr/README.md) | Master ADR index: KEDA (0001), ARIMA (0002), HTMX Dashboard (0003) |
+| [**End-to-End Testing Guide**](docs/e2e-testing-guide.md) | Pytest E2E architecture, local/Kind/CI execution, and troubleshooting |
+| [**Live Web Dashboard Guide**](docs/dashboard-guide.md) | HTMX partial update architecture, layout guide, and customization |
+| [**Producer REST API Guide**](docs/producer-api-guide.md) | Batch SQS message generation, API schema reference, and load testing |
+| [**GitOps with ArgoCD Guide**](docs/gitops-guide.md) | Declarative sync, self-healing, and KEDA ignoreDifferences configuration |
+| [**Supply Chain & SBOM Policy Guide**](docs/sbom-guide.md) | Syft SBOM generation, Grype vulnerability gating, and license compliance |
+| [**Runtime Security with Falco Guide**](docs/falco-guide.md) | eBPF kernel syscall monitoring and custom MITRE ATT&CK detection rules |
+| [**Policy as Code with OPA Gatekeeper**](docs/policy-guide.md) | Admission control constraint templates enforcing non-root and resource limits |
+| [**Trivy Security Scanning Guide**](docs/security-guide.md) | Automated CVE vulnerability scanning across containers and Terraform IaC |
 
 ---
 
-## SLOs at a Glance
+## ⚖️ License
 
-| Metric | Target | Measures |
-|---|---|---|
-| Scale-up lag (burst) | ≤ 45s | Time from spike to pods Ready |
-| P99 processing latency | ≤ 5s | Slowest 1% of messages |
-| Error rate | < 1% | Failed / total messages |
-| Pod recovery (kill) | ≤ 90s | KEDA reschedule after pod delete |
-| Scale-to-zero | ≤ 360s | Pods gone after queue empties |
-
----
-
-## Comparison to GCP Reference
-
-This project is the AWS equivalent of [gcp-keda-gke-event-driven-autoscaling-demo](https://github.com/ChimbuChinnadurai/gcp-keda-gke-event-driven-autoscaling-demo), with additional innovations:
-
-| Capability | GCP Reference | SmartScale AI (This Project) |
-|---|---|---|
-| Queue-based autoscaling | ✅ Pub/Sub + KEDA | ✅ SQS + KEDA |
-| Scale to zero | ✅ | ✅ |
-| AI Predictive Scaling | ❌ | ✅ (scikit-learn External Scaler) |
-| Spot instance fleet | ❌ | ✅ (5 instance types, NTH) |
-| Chaos engineering suite | ❌ | ✅ (5 experiments + GameDay runbook) |
-| Multi-environment Kustomize | ❌ | ✅ (dev/staging/prod overlays) |
-| Prometheus + Alerting | ❌ | ✅ (7 alert rules, Grafana) |
-
----
-
-## Contributing
-
-See [`docs/contributing.md`](docs/contributing.md) for:
-- Local dev setup and prerequisites
-- How to run all test suites
-- Commit message convention (Conventional Commits enforced by CI)
-- Architecture rules that must not be broken
-
----
-
-## License
-
-MIT — see [LICENSE](LICENSE)
+Distributed under the MIT License. See [`LICENSE`](LICENSE) for details.
