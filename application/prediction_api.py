@@ -153,11 +153,13 @@ def _init_predictor():
             _model_type = "linear_regression"
 
     if _model_type == "linear_regression" or _predictor is None:
-        from ai.predictor import QueueDepthPredictor
+        from ai.predictor import QueueDepthPredictor, PredictorConfig
         _predictor = QueueDepthPredictor(
-            horizon_minutes=_config.horizon_minutes,
-            target_queue_length=_config.target_queue_length,
-            max_replicas=_config.max_replicas,
+            config=PredictorConfig(
+                horizon_minutes=_config.horizon_minutes,
+                target_queue_length=_config.target_queue_length,
+                max_replicas=_config.max_replicas,
+            )
         )
         _model_type = "linear_regression"
         logger.info("Linear Regression predictor initialised")

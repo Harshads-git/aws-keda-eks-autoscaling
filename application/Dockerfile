@@ -59,7 +59,8 @@ WORKDIR /app
 
 # Copy application source (separate COPY to leverage layer caching)
 # If requirements.txt hasn't changed, only this layer needs rebuilding
-COPY app.py .
+COPY *.py .
+COPY ai/ ./ai/
 
 # Set ownership to non-root user
 RUN chown -R appuser:appuser /app
