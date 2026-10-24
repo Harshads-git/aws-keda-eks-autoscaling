@@ -1,0 +1,53 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: elasticmq-config
+  namespace: keda-demo
+data:
+  elasticmq.conf: |
+    include classpath("application.conf")
+
+    node-address {
+        protocol = http
+        host = "local-sqs.keda-demo.svc.cluster.local"
+        port = 9324
+        context = ""
+    }
+
+    queues {
+        keda-demo-queue {
+            defaultVisibilityTimeout = 30 seconds
+            delay = 0 seconds
+            receiveMessageWait = 20 seconds
+        }
+        priority-orders {
+            defaultVisibilityTimeout = 30 seconds
+            delay = 0 seconds
+            receiveMessageWait = 20 seconds
+        }
+        batch-orders {
+            defaultVisibilityTimeout = 30 seconds
+            delay = 0 seconds
+            receiveMessageWait = 20 seconds
+        }
+        dead-letter {
+            defaultVisibilityTimeout = 30 seconds
+            delay = 0 seconds
+            receiveMessageWait = 20 seconds
+        }
+        keda-demo-queue-priority {
+            defaultVisibilityTimeout = 30 seconds
+            delay = 0 seconds
+            receiveMessageWait = 20 seconds
+        }
+        keda-demo-queue-batch {
+            defaultVisibilityTimeout = 30 seconds
+            delay = 0 seconds
+            receiveMessageWait = 20 seconds
+        }
+        keda-demo-queue-dlq {
+            defaultVisibilityTimeout = 30 seconds
+            delay = 0 seconds
+            receiveMessageWait = 20 seconds
+        }
+    }

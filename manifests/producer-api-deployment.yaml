@@ -63,7 +63,7 @@ spec:
 
       containers:
         - name: producer-api
-          image: keda-demo-app:latest
+          image: docker.io/library/keda-demo-app:v2
           imagePullPolicy: IfNotPresent
           command: ["python", "producer_api.py"]
 

@@ -89,7 +89,7 @@ spec:
 
       containers:
         - name: dashboard
-          image: keda-demo-app:latest
+          image: docker.io/library/keda-demo-app:v2
           imagePullPolicy: IfNotPresent
           command: ["python", "dashboard.py"]
 
@@ -112,17 +112,33 @@ spec:
                   name: keda-demo-config
                   key: SQS_QUEUE_URL
 
+            - name: SQS_ENDPOINT_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: keda-demo-config
+                  key: SQS_ENDPOINT_URL
+                  optional: true
+
             - name: PRIORITY_QUEUE_URL
               valueFrom:
                 configMapKeyRef:
                   name: keda-demo-config
-                  key: SQS_QUEUE_URL
+                  key: PRIORITY_QUEUE_URL
+                  optional: true
 
             - name: BATCH_QUEUE_URL
               valueFrom:
                 configMapKeyRef:
                   name: keda-demo-config
-                  key: SQS_QUEUE_URL
+                  key: BATCH_QUEUE_URL
+                  optional: true
+
+            - name: DLQ_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: keda-demo-config
+                  key: DLQ_URL
+                  optional: true
 
             # AWS credentials for SQS
             - name: AWS_DEFAULT_REGION
