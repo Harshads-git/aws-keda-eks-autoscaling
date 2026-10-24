@@ -405,16 +405,24 @@ a{color:var(--indigo2)}
 .slider-wrap label{font-size:.8rem;color:var(--muted);width:110px;flex-shrink:0}
 input[type=range]{flex:1;accent-color:var(--indigo);cursor:pointer}
 .slider-val{width:50px;text-align:right;font-weight:700;color:var(--indigo2);font-size:.9rem}
-.traffic-tubes{display:flex;gap:24px;align-items:flex-end;margin:20px 0;height:160px}
-.tube-wrap{flex:1;display:flex;flex-direction:column;align-items:center;gap:6px}
-.tube-label{font-size:.72rem;color:var(--muted);text-transform:uppercase;letter-spacing:.06em}
-.tube{flex:1;width:60px;background:var(--surface2);border:1px solid var(--border);
-  border-radius:6px;overflow:hidden;display:flex;align-items:flex-end;position:relative}
-.tube-fill{width:100%;transition:height .5s ease;border-radius:4px}
-.tube-p .tube-fill{background:linear-gradient(to top,var(--indigo),var(--indigo2))}
-.tube-b .tube-fill{background:linear-gradient(to top,#0e7490,var(--cyan))}
+/* Live Queue Tubes */
+.traffic-tubes{display:flex;gap:40px;justify-content:center;align-items:center;margin:16px 0;padding:12px 0}
+.tube-wrap{display:flex;flex-direction:column;align-items:center;gap:8px}
+.tube-label{font-size:.78rem;font-weight:700;letter-spacing:.08em;text-transform:uppercase}
+.tube{width:76px;height:170px;background:#0b1324;border:2px solid var(--border);
+  border-radius:38px 38px 12px 12px;overflow:hidden;display:flex;align-items:flex-end;position:relative;
+  box-shadow:inset 0 4px 16px rgba(0,0,0,.7),0 4px 14px rgba(0,0,0,.4)}
+.tube-glass-line{position:absolute;top:12px;left:8px;bottom:12px;width:3px;
+  background:linear-gradient(to bottom,rgba(255,255,255,0.35),rgba(255,255,255,0.05));border-radius:2px;pointer-events:none;z-index:3}
+.tube-ticks{position:absolute;right:8px;top:24px;bottom:24px;display:flex;flex-direction:column;justify-content:space-between;pointer-events:none;z-index:2}
+.tube-ticks span{width:8px;height:1px;background:rgba(255,255,255,0.2)}
+.tube-fill{width:100%;transition:height .4s cubic-bezier(.4,0,.2,1);border-radius:0 0 10px 10px;min-height:8px}
+.tube-p .tube-fill{background:linear-gradient(to top,#4338ca,#6366f1,#a5b4fc);box-shadow:0 -2px 12px rgba(99,102,241,.6)}
+.tube-b .tube-fill{background:linear-gradient(to top,#0e7490,#06b6d4,#67e8f9);box-shadow:0 -2px 12px rgba(34,211,238,.6)}
 .tube-depth{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);
-  font-size:.8rem;font-weight:700;color:#fff;text-shadow:0 1px 4px rgba(0,0,0,.8)}
+  font-size:1.1rem;font-weight:800;color:#ffffff;text-shadow:0 2px 8px rgba(0,0,0,.9);pointer-events:none;z-index:4;
+  background:rgba(7,12,20,0.65);padding:2px 10px;border-radius:12px;border:1px solid rgba(255,255,255,0.12)}
+.tube-sub{font-size:.7rem;color:var(--muted)}
 .send-btn{padding:12px 28px;background:var(--indigo);color:#fff;border:none;
   border-radius:8px;font-size:.9rem;font-weight:600;cursor:pointer;transition:all .2s;width:100%}
 .send-btn:hover{background:var(--indigo2);transform:translateY(-1px)}
@@ -488,6 +496,10 @@ document.addEventListener('DOMContentLoaded',function(){
   var saved=localStorage.getItem('activeTab')||'live';
   showTab(saved);
   startChart();
+  refreshChart();
+  refreshTubes();
+  refreshArena();
+  refreshCost();
   setInterval(refreshChart,"""
         + rs +
         """);
@@ -569,18 +581,19 @@ function refreshChart(){
 function refreshTubes(){
   fetch('/api/chart-data').then(function(r){return r.json()}).then(function(d){
     var pts=d.points||[];
-    if(!pts.length) return;
-    var last=pts[pts.length-1];
-    var pPct=Math.min(100,((last.priority||0)/80)*100);
-    var bPct=Math.min(100,((last.batch||0)/80)*100);
+    var last = pts.length ? pts[pts.length-1] : {priority: 0, batch: 0};
+    var pVal = (last.priority !== undefined) ? Number(last.priority) : 0;
+    var bVal = (last.batch !== undefined) ? Number(last.batch) : 0;
+    var pPct = Math.min(100, Math.max(pVal > 0 ? 8 : 4, Math.round((pVal / 80) * 100)));
+    var bPct = Math.min(100, Math.max(bVal > 0 ? 8 : 4, Math.round((bVal / 80) * 100)));
     var ep=document.getElementById('tube-fill-p');
     var eb=document.getElementById('tube-fill-b');
     var dp=document.getElementById('tube-depth-p');
     var db=document.getElementById('tube-depth-b');
     if(ep) ep.style.height=pPct+'%';
     if(eb) eb.style.height=bPct+'%';
-    if(dp) dp.textContent=last.priority||0;
-    if(db) db.textContent=last.batch||0;
+    if(dp) dp.textContent=pVal;
+    if(db) db.textContent=bVal;
   }).catch(function(){});
 }
 
@@ -631,6 +644,8 @@ function sendTraffic(){
     body:JSON.stringify({priority:p,batch:b})
   }).then(function(r){return r.json()}).then(function(d){
     document.getElementById('traffic-status').textContent=d.msg||'Sent!';
+    setTimeout(refreshTubes, 150);
+    setTimeout(refreshChart, 150);
   }).catch(function(e){
     document.getElementById('traffic-status').textContent='Error: '+e;
   });
@@ -831,21 +846,27 @@ def _html_page(online: bool) -> str:
         '      <div class="box-title">&#128300; Live Queue Tubes</div>\n'
         '      <div class="traffic-tubes">\n'
         '        <div class="tube-wrap">\n'
-        '          <div class="tube-label">Priority</div>\n'
+        '          <div class="tube-label" style="color:var(--indigo2)">Priority Queue</div>\n'
         '          <div class="tube tube-p">\n'
-        '            <div class="tube-fill" id="tube-fill-p" style="height:10%"></div>\n'
+        '            <div class="tube-glass-line"></div>\n'
+        '            <div class="tube-ticks"><span></span><span></span><span></span></div>\n'
+        '            <div class="tube-fill" id="tube-fill-p" style="height:12%"></div>\n'
         '            <span class="tube-depth" id="tube-depth-p">0</span>\n'
         '          </div>\n'
+        '          <div class="tube-sub">High SLA Lane</div>\n'
         '        </div>\n'
         '        <div class="tube-wrap">\n'
-        '          <div class="tube-label">Batch</div>\n'
+        '          <div class="tube-label" style="color:var(--cyan)">Batch Queue</div>\n'
         '          <div class="tube tube-b">\n'
-        '            <div class="tube-fill" id="tube-fill-b" style="height:5%"></div>\n'
+        '            <div class="tube-glass-line"></div>\n'
+        '            <div class="tube-ticks"><span></span><span></span><span></span></div>\n'
+        '            <div class="tube-fill" id="tube-fill-b" style="height:8%"></div>\n'
         '            <span class="tube-depth" id="tube-depth-b">0</span>\n'
         '          </div>\n'
+        '          <div class="tube-sub">Bulk Lane</div>\n'
         '        </div>\n'
         '      </div>\n'
-        '      <p style="font-size:.75rem;color:var(--muted)">Tubes update every ' + rs + 's and reflect actual queue depths.</p>\n'
+        '      <p style="font-size:.75rem;color:var(--muted);text-align:center">Tubes update dynamically and reflect active queue depths.</p>\n'
         '    </div>\n'
         '  </div>\n'
         '  <div class="box">\n'
@@ -1111,6 +1132,16 @@ def create_app() -> FastAPI:
     @app.on_event("startup")
     async def _startup():
         _init_sqs()
+        s = _get_stats()
+        ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
+        _chart_buf.append({
+            "ts":         ts,
+            "priority":   s.get("p_depth", 0),
+            "batch":      s.get("b_depth", 0),
+            "ai_pods":    s.get("ai_pods", 1),
+            "react_pods": s.get("react_pods", 1),
+            "actual_pods":s.get("actual_pods", 1),
+        })
         asyncio.create_task(_bg_tick())
 
     # Main page
@@ -1227,6 +1258,16 @@ def create_app() -> FastAPI:
         b = int(body.get("batch", 0))
         if not _online:
             _sim.send_traffic(p, b)
+            s = _get_stats()
+            ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
+            _chart_buf.append({
+                "ts":         ts,
+                "priority":   s.get("p_depth", 0),
+                "batch":      s.get("b_depth", 0),
+                "ai_pods":    s.get("ai_pods", 1),
+                "react_pods": s.get("react_pods", 1),
+                "actual_pods":s.get("actual_pods", 1),
+            })
             return JSONResponse({"msg": "Injected " + str(p) + " priority + " + str(b) + " batch msgs into simulation"})
         try:
             import httpx
