@@ -226,6 +226,11 @@ def _init_sqs():
             aws_secret_access_key=AWS_SECRET,
             config=BotoConfig(connect_timeout=2, read_timeout=2, retries={"max_attempts": 1}),
         )
+        for q_name in ["priority-orders", "batch-orders", "dead-letter", "keda-demo-queue"]:
+            try:
+                client.create_queue(QueueName=q_name)
+            except Exception:
+                pass
         client.get_queue_attributes(QueueUrl=PRIORITY_QUEUE, AttributeNames=["ApproximateNumberOfMessages"])
         _sqs    = client
         _online = True
