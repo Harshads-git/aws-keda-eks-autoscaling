@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 import boto3
+from botocore.config import Config as BotoConfig
 from botocore.exceptions import BotoCoreError, ClientError
 from fastapi import FastAPI, Response
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
@@ -221,6 +222,7 @@ def _init_sqs():
             endpoint_url=SQS_ENDPOINT,
             aws_access_key_id="test",
             aws_secret_access_key="test",
+            config=BotoConfig(connect_timeout=1, read_timeout=1, retries={"max_attempts": 0}),
         )
         client.get_queue_attributes(QueueUrl=PRIORITY_QUEUE, AttributeNames=["ApproximateNumberOfMessages"])
         _sqs    = client
