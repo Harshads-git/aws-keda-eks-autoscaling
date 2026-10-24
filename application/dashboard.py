@@ -31,8 +31,10 @@ log = logging.getLogger("dashboard")
 # ──────────────────────────────────────────────────────────────────────────────
 # Config
 # ──────────────────────────────────────────────────────────────────────────────
-SQS_ENDPOINT  = os.getenv("SQS_ENDPOINT_URL", "http://localhost:9324")
+SQS_ENDPOINT  = os.getenv("SQS_ENDPOINT_URL") or os.getenv("AWS_ENDPOINT_URL") or "http://localhost:9324"
 AWS_REGION    = os.getenv("AWS_DEFAULT_REGION", "us-east-1")
+AWS_KEY_ID    = os.getenv("AWS_ACCESS_KEY_ID", "test")
+AWS_SECRET    = os.getenv("AWS_SECRET_ACCESS_KEY", "test")
 PRIORITY_QUEUE= os.getenv("PRIORITY_QUEUE_URL", f"{SQS_ENDPOINT}/000000000000/priority-orders")
 BATCH_QUEUE   = os.getenv("BATCH_QUEUE_URL",    f"{SQS_ENDPOINT}/000000000000/batch-orders")
 DLQ_URL       = os.getenv("DLQ_URL",            f"{SQS_ENDPOINT}/000000000000/dead-letter")
@@ -220,9 +222,9 @@ def _init_sqs():
             "sqs",
             region_name=AWS_REGION,
             endpoint_url=SQS_ENDPOINT,
-            aws_access_key_id="test",
-            aws_secret_access_key="test",
-            config=BotoConfig(connect_timeout=1, read_timeout=1, retries={"max_attempts": 0}),
+            aws_access_key_id=AWS_KEY_ID,
+            aws_secret_access_key=AWS_SECRET,
+            config=BotoConfig(connect_timeout=2, read_timeout=2, retries={"max_attempts": 1}),
         )
         client.get_queue_attributes(QueueUrl=PRIORITY_QUEUE, AttributeNames=["ApproximateNumberOfMessages"])
         _sqs    = client
