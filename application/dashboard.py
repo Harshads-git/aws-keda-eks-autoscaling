@@ -218,19 +218,30 @@ _chart_buf: deque = deque(maxlen=60)   # 60 x 3s = 3 min history
 def _init_sqs():
     global _sqs, _online
     try:
-        client = boto3.client(
-            "sqs",
-            region_name=AWS_REGION,
-            endpoint_url=SQS_ENDPOINT,
-            aws_access_key_id=AWS_KEY_ID,
-            aws_secret_access_key=AWS_SECRET,
-            config=BotoConfig(connect_timeout=2, read_timeout=2, retries={"max_attempts": 1}),
-        )
-        for q_name in ["priority-orders", "batch-orders", "dead-letter", "keda-demo-queue"]:
-            try:
-                client.create_queue(QueueName=q_name)
-            except Exception:
-                pass
+        kwargs = {
+            "service_name": "sqs",
+            "region_name": AWS_REGION,
+            "config": BotoConfig(connect_timeout=3, read_timeout=3, retries={"max_attempts": 1}),
+        }
+        if AWS_KEY_ID and AWS_KEY_ID != "test":
+            kwargs["aws_access_key_id"] = AWS_KEY_ID
+            kwargs["aws_secret_access_key"] = AWS_SECRET
+        elif "localhost" in SQS_ENDPOINT or "local-sqs" in SQS_ENDPOINT:
+            kwargs["aws_access_key_id"] = "test"
+            kwargs["aws_secret_access_key"] = "test"
+
+        if SQS_ENDPOINT and not ("amazonaws.com" in SQS_ENDPOINT and "https://sqs." not in SQS_ENDPOINT):
+            kwargs["endpoint_url"] = SQS_ENDPOINT
+
+        client = boto3.client(**kwargs)
+
+        if "localhost" in SQS_ENDPOINT or "local-sqs" in SQS_ENDPOINT:
+            for q_name in ["priority-orders", "batch-orders", "dead-letter", "keda-demo-queue"]:
+                try:
+                    client.create_queue(QueueName=q_name)
+                except Exception:
+                    pass
+
         client.get_queue_attributes(QueueUrl=PRIORITY_QUEUE, AttributeNames=["ApproximateNumberOfMessages"])
         _sqs    = client
         _online = True
@@ -677,11 +688,13 @@ function chaos(action){
 # Full HTML page
 # ──────────────────────────────────────────────────────────────────────────────
 def _html_page(online: bool) -> str:
-    badge = (
-        '<span class="badge badge-green">&#9679; ONLINE</span>'
-        if online else
-        '<span class="badge badge-offline">&#9675; DEMO MODE</span>'
-    )
+    if online:
+        if "amazonaws.com" in SQS_ENDPOINT or "amazonaws.com" in PRIORITY_QUEUE:
+            badge = f'<span class="badge badge-green">&#9679; ONLINE (AWS CLOUD SQS &bull; {AWS_REGION})</span>'
+        else:
+            badge = '<span class="badge badge-green">&#9679; ONLINE (K8s CLUSTER)</span>'
+    else:
+        badge = '<span class="badge badge-offline">&#9675; DEMO MODE</span>'
     mode_note = (
         ""
         if online else
@@ -1279,14 +1292,33 @@ def create_app() -> FastAPI:
             })
             return JSONResponse({"msg": "Injected " + str(p) + " priority + " + str(b) + " batch msgs into simulation"})
         try:
-            import httpx
-            async with httpx.AsyncClient(timeout=5) as c:
-                if p:
-                    await c.post(PRODUCER_API + "/send/priority", json={"count": p})
-                if b:
-                    await c.post(PRODUCER_API + "/send/batch", json={"count": b})
+            sent_via_producer = False
+            try:
+                import httpx
+                async with httpx.AsyncClient(timeout=2) as c:
+                    if p:
+                        await c.post(PRODUCER_API + "/send/priority", json={"count": p})
+                    if b:
+                        await c.post(PRODUCER_API + "/send/batch", json={"count": b})
+                    sent_via_producer = True
+            except Exception:
+                sent_via_producer = False
+
+            if not sent_via_producer and _sqs:
+                import json
+                for i in range(p):
+                    _sqs.send_message(
+                        QueueUrl=PRIORITY_QUEUE,
+                        MessageBody=json.dumps({"order_id": f"p-{int(time.time())}-{i}", "type": "priority"})
+                    )
+                for i in range(b):
+                    _sqs.send_message(
+                        QueueUrl=BATCH_QUEUE,
+                        MessageBody=json.dumps({"order_id": f"b-{int(time.time())}-{i}", "type": "batch"})
+                    )
             _prom["messages_sent_total"] += p + b
-            return JSONResponse({"msg": "Sent " + str(p) + " priority + " + str(b) + " batch via producer API"})
+            dest = "SQS" if not sent_via_producer else "producer API"
+            return JSONResponse({"msg": f"Sent {p} priority + {b} batch directly to {dest}!"})
         except Exception as ex:
             return JSONResponse({"msg": "Error: " + str(ex)}, status_code=500)
 
