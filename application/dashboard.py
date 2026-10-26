@@ -22,6 +22,13 @@ from fastapi import FastAPI, Response
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 import uvicorn
 
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+    load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
+except ImportError:
+    pass
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Logging
 # ──────────────────────────────────────────────────────────────────────────────
@@ -38,6 +45,14 @@ AWS_SECRET    = os.getenv("AWS_SECRET_ACCESS_KEY", "test")
 PRIORITY_QUEUE= os.getenv("PRIORITY_QUEUE_URL", f"{SQS_ENDPOINT}/000000000000/priority-orders")
 BATCH_QUEUE   = os.getenv("BATCH_QUEUE_URL",    f"{SQS_ENDPOINT}/000000000000/batch-orders")
 DLQ_URL       = os.getenv("DLQ_URL",            f"{SQS_ENDPOINT}/000000000000/dead-letter")
+
+if PRIORITY_QUEUE.startswith("https://") and ("localhost" in SQS_ENDPOINT or "local-sqs" in SQS_ENDPOINT):
+    import urllib.parse
+    _parsed = urllib.parse.urlparse(PRIORITY_QUEUE)
+    SQS_ENDPOINT = f"{_parsed.scheme}://{_parsed.netloc}"
+    _parts = _parsed.netloc.split(".")
+    if len(_parts) >= 4 and _parts[0] == "sqs":
+        AWS_REGION = _parts[1]
 PRODUCER_API  = os.getenv("PRODUCER_API_URL",   "http://localhost:8091")
 PREDICT_API   = os.getenv("PREDICTOR_API_URL",  "http://localhost:8090")
 NAMESPACE     = os.getenv("K8S_NAMESPACE",      "keda-demo")
