@@ -25,7 +25,6 @@ import uvicorn
 try:
     from dotenv import load_dotenv
     load_dotenv()
-    load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
     load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
 except ImportError:
     pass
@@ -687,6 +686,21 @@ function sendTraffic(){
   });
 }
 
+// Reset / Purge Queues
+function resetQueues(){
+  var st=document.getElementById('traffic-status');
+  if(st) st.textContent='Purging queues...';
+  fetch('/api/queues/reset',{method:'POST'})
+    .then(function(r){return r.json()})
+    .then(function(d){
+      if(st) st.textContent=d.msg||'Queues reset to 0!';
+      setTimeout(refreshTubes, 200);
+      setTimeout(refreshChart, 200);
+    }).catch(function(e){
+      if(st) st.textContent='Reset error: '+e;
+    });
+}
+
 // Chaos actions
 function chaos(action){
   var el=document.getElementById('chaos-status');
@@ -881,7 +895,10 @@ def _html_page(online: bool) -> str:
         '      <div style="margin-top:10px;font-size:.78rem;color:var(--muted);min-height:20px" id="traffic-status"></div>\n'
         '    </div>\n'
         '    <div class="box">\n'
-        '      <div class="box-title">&#128300; Live Queue Tubes</div>\n'
+        '      <div class="box-title" style="display:flex;justify-content:space-between;align-items:center;">\n'
+        '        <span>&#128300; Live Queue Tubes</span>\n'
+        '        <button class="preset-btn" style="padding:4px 10px;font-size:0.75rem;cursor:pointer;" onclick="resetQueues()">&#128260; Reset / Purge</button>\n'
+        '      </div>\n'
         '      <div class="traffic-tubes">\n'
         '        <div class="tube-wrap">\n'
         '          <div class="tube-label" style="color:var(--indigo2)">Priority Queue</div>\n'
@@ -1337,6 +1354,34 @@ def create_app() -> FastAPI:
             return JSONResponse({"msg": f"Sent {p} priority + {b} batch directly to {dest}!"})
         except Exception as ex:
             return JSONResponse({"msg": "Error: " + str(ex)}, status_code=500)
+
+    # Queue Purge / Reset
+    @app.post("/api/queues/reset")
+    async def api_queues_reset():
+        if not _online:
+            _sim.p_depth = 0
+            _sim.b_depth = 0
+            _chart_buf.clear()
+            return JSONResponse({"msg": "Queues reset to 0!"})
+        purged = []
+        if _sqs:
+            for q_url, name in [(PRIORITY_QUEUE, "priority"), (BATCH_QUEUE, "batch"), (DLQ_URL, "dlq")]:
+                if q_url:
+                    try:
+                        _sqs.purge_queue(QueueUrl=q_url)
+                        purged.append(name)
+                    except Exception as e:
+                        try:
+                            # If AWS 60s purge limit is in effect, actively drain messages
+                            res = _sqs.receive_message(QueueUrl=q_url, MaxNumberOfMessages=10, WaitTimeSeconds=1)
+                            for m in res.get("Messages", []):
+                                _sqs.delete_message(QueueUrl=q_url, ReceiptHandle=m["ReceiptHandle"])
+                            purged.append(f"{name} drained")
+                        except Exception:
+                            pass
+        _chart_buf.clear()
+        msg_detail = f" ({', '.join(purged)})" if purged else ""
+        return JSONResponse({"msg": f"Queues purged & reset to 0{msg_detail}!"})
 
     # Health + Metrics
     @app.get("/health")
